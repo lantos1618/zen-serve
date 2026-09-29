@@ -31,11 +31,19 @@ Watch* = {
 
 // Registers every directory and file under the newline-separated roots.
 // Temporaries come from `scratch`; the backend keeps nothing from it.
-arm* = <W: Watch>(watch :: W, scratch: Alloc, roots: str) Res<usize, AllocError> {
+arm* = <W: Watch>(
+    watch   :: W,
+    scratch : Alloc,
+    roots   : str
+) Res<usize, AllocError> {
     watch.reset();
     roots.split('\n').loop((root) {
         (root.len > 0).then(() {
-            walk(scratch, root, (path, kind) { watch.add(path, kind, path == root); }).try();
+            walk(
+                scratch,
+                root,
+                (path, kind) { watch.add(path, kind, path == root); }
+            ).try();
         });
     });
     Ok(watch.count())
@@ -52,7 +60,7 @@ Debounce* = {
 
     touch* = (self :: @Self, now_ms: u64) {
         self.pending = true;
-        self.last = now_ms;
+        self.last    = now_ms;
         self.changes = self.changes + 1;
     }
 
@@ -67,14 +75,16 @@ Debounce* = {
             false => idle_ms,
             true  => (now_ms >= self.last + self.quiet_ms).match({
                 true  => 0,
-                false => (self.last + self.quiet_ms - now_ms).to_i32().value_or(idle_ms),
+                false => (self.last + self.quiet_ms - now_ms).to_i32().value_or(
+                    idle_ms
+                ),
             }),
         })
     }
 
     // The number of notifications in the burst; clears it.
     take* = (self :: @Self) usize {
-        count = self.changes;
+        count        = self.changes;
         self.pending = false;
         self.changes = 0;
         count
@@ -102,8 +112,8 @@ BuildQueue* = {
     // True when the caller must build now.
     run* = (self :: @Self) bool {
         self.queued = false;
-        build = self.dirty;
-        self.dirty = false;
+        build       = self.dirty;
+        self.dirty  = false;
         build
     }
 }

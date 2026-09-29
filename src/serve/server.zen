@@ -37,9 +37,13 @@ Wake* = {
         fds = a.realloc<i32>(null_ptr<i32>(), 2).try();
         (Unix.pipe(fds) == 0).ensure(AllocError.OutOfMemory).try();
         Range(0, 2).loop((i) {
-            fd = fds.read(i);
+            fd    = fds.read(i);
             flags = Descriptor.fcntl(fd, Descriptor.F_GETFL, 0);
-            Descriptor.fcntl(fd, Descriptor.F_SETFL, flags + Descriptor.O_NONBLOCK);
+            Descriptor.fcntl(
+                fd,
+                Descriptor.F_SETFL,
+                flags + Descriptor.O_NONBLOCK
+            );
         });
         Ok(Wake(reader: fds.read(0), writer: fds.read(1)))
     }
@@ -58,7 +62,10 @@ Server*<B: TransportBackend> = {
     // Startup outcome for the spawning thread: one byte, 1 = listening.
     status: i32,
     clock: Clock,
-    adapter :: PoolAlloc = PoolAlloc(pool: null_ptr<Pool>(), policy: PoolPolicy(cache_bytes: 0, block_bytes: 0, blocks: 0)),
+    adapter :: PoolAlloc = PoolAlloc(
+        pool: null_ptr<Pool>(),
+        policy: PoolPolicy(cache_bytes: 0, block_bytes: 0, blocks: 0)
+    ),
     engine :: Ptr<Engine<DevShard<B>>> = null_ptr<Engine<DevShard<B>>>(),
     byte :: Ptr<u8> = null_ptr<u8>(),
     pending :: i64 = 0,
@@ -66,12 +73,32 @@ Server*<B: TransportBackend> = {
     finished :: bool = false,
 
     setup = (self :: @Self, ctx: Context) Res<(), StartError> {
-        cell = ctx.alloc.realloc<Pool>(null_ptr<Pool>(), 1).try(StartError.Allocation);
+        cell = ctx.alloc.realloc<Pool>(
+            null_ptr<Pool>(),
+            1
+        ).try(StartError.Allocation);
         cell.write(0, Pool());
-        self.adapter = PoolAlloc(pool: cell, policy: PoolPolicy(cache_bytes: 16777216, block_bytes: 4194304, blocks: 64));
-        self.byte = ctx.alloc.raw(8, 8).try(StartError.Allocation);
-        slot = ctx.alloc.realloc<Engine<DevShard<B>>>(null_ptr<Engine<DevShard<B>>>(), 1).try(StartError.Allocation);
-        engine = open_engine(self.shard, self.adapter, self.adapter, self.clock, Admission.Own, self.wake.reader).try();
+        self.adapter = PoolAlloc(
+            pool: cell,
+            policy: PoolPolicy(
+                cache_bytes: 16777216,
+                block_bytes: 4194304,
+                blocks: 64
+            )
+        );
+        self.byte    = ctx.alloc.raw(8, 8).try(StartError.Allocation);
+        slot         = ctx.alloc.realloc<Engine<DevShard<B>>>(
+            null_ptr<Engine<DevShard<B>>>(),
+            1
+        ).try(StartError.Allocation);
+        engine       = open_engine(
+            self.shard,
+            self.adapter,
+            self.adapter,
+            self.clock,
+            Admission.Own,
+            self.wake.reader
+        ).try();
         slot.write(0, engine);
         self.engine = slot;
         Ok(())
@@ -98,7 +125,9 @@ Server*<B: TransportBackend> = {
                 Done   => { self.finish(); h.break(); },
                 Failed => { self.finish(); h.break(); },
                 Idle   => {
-                    (self.pending <= 0 && self.queued > 0).then(() { h.break(); });
+                    (self.pending <= 0 && self.queued > 0).then(
+                        () { h.break(); }
+                    );
                     (self.pending <= 0).then(() {
                         me.turn(me).match({
                             Ok(_)  => { self.queued = self.queued + 1; h.break(); },
@@ -143,8 +172,14 @@ Server*<B: TransportBackend> = {
             self.flush();
             event.match({
                 Building => (),
-                Built    => { ctx.env.out.println("zen-serve: reload sent to {} browser tab(s)", reached).ignore(); ctx.env.out.flush().ignore(); },
-                Failed   => { ctx.env.out.println("zen-serve: build error sent to {} browser tab(s)", reached).ignore(); ctx.env.out.flush().ignore(); },
+                Built    => { ctx.env.out.println(
+                    "zen-serve: reload sent to {} browser tab(s)",
+                    reached
+                ).ignore(); ctx.env.out.flush().ignore(); },
+                Failed   => { ctx.env.out.println(
+                    "zen-serve: build error sent to {} browser tab(s)",
+                    reached
+                ).ignore(); ctx.env.out.flush().ignore(); },
             });
             self.serve(me);
         });

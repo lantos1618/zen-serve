@@ -32,7 +32,7 @@ append_event* = (out :: String, kind: str, data: str) Res<(), AllocError> {
 
 // A comment line: ignored by EventSource, but it makes a dead connection
 // fail its next write so the server can reclaim the slot.
-append_heartbeat* = (out :: String) Res<(), AllocError> { out.add(": ping\n\n") }
+HEARTBEAT*: str = ": ping\n\n"
 
 // The server's current answer for a newly connected client.
 BuildState* = Ready | Failed
@@ -46,13 +46,17 @@ Hub* = {
 
     // Bytes a freshly connected client receives right after the headers.
     greeting* = (self: @Self, a: Alloc) Res<String, AllocError> {
-        out ::= a.String().try();
+        out    ::= a.String().try();
         number ::= a.String().try();
         number.write_usize(self.generation.to_usize().value_or(0)).try();
         append_event(out, HELLO, number.view()).try();
         self.state.match({
             Ready  => (),
-            Failed => append_event(out, BUILD_ERROR, self.diagnostics.view()).try(),
+            Failed => append_event(
+                out,
+                BUILD_ERROR,
+                self.diagnostics.view()
+            ).try(),
         });
         Ok(out)
     }
@@ -65,9 +69,9 @@ Hub* = {
 
     succeeded* = (self :: @Self, a: Alloc) Res<String, AllocError> {
         self.generation = self.generation + 1;
-        self.state = BuildState.Ready;
+        self.state      = BuildState.Ready;
         self.diagnostics.clear();
-        out ::= a.String().try();
+        out    ::= a.String().try();
         number ::= a.String().try();
         number.write_usize(self.generation.to_usize().value_or(0)).try();
         append_event(out, RELOAD, number.view()).try();
@@ -85,5 +89,9 @@ Hub* = {
 }
 
 hub* = (a: Alloc) Res<Hub, AllocError> {
-    Ok(Hub(generation: 1, state: BuildState.Ready, diagnostics: a.String().try()))
+    Ok(Hub(
+        generation: 1,
+        state: BuildState.Ready,
+        diagnostics: a.String().try()
+    ))
 }

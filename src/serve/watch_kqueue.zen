@@ -1,7 +1,7 @@
 // macOS/BSD watch backend: one kqueue, one EVFILT_VNODE registration per
 // watched directory and file. A vnode event needs an open descriptor, so
-// the process descriptor limit bounds the watched set (MAX_WATCHES; raise
-// RLIMIT_NOFILE before arming a large tree). Directory events report entries
+// the watched set is bounded by MAX_WATCHES and by the descriptor limit,
+// whose soft value `open` raises (macOS starts processes at 256). Directory events report entries
 // being added, removed or renamed; file events report writes in place.
 Alloc, AllocError, Ptr, null_ptr = std.mem
 str = std.text
@@ -33,9 +33,35 @@ Files = c.bind("fcntl.h", {
     open = (path: Ptr<c_char>, flags: i32) i32
 })
 Unix = c.bind("unistd.h", { close = (fd: i32) i32 })
+Limit = c.record("sys/resource.h", "struct rlimit", { rlim_cur: u64, rlim_max: u64 })
+Resources = c.bind("sys/resource.h", {
+    RLIMIT_NOFILE: i32
+    getrlimit = (resource: i32, limit: Ptr<Limit>) i32
+    setrlimit = (resource: i32, limit: Ptr<Limit>) i32
+})
 
 MAX_WATCHES*: usize = 4096
 EVENTS: usize = 64
+
+// Raises the soft descriptor limit toward MAX_WATCHES plus room for
+// connections, within the hard limit. Failure leaves the limit unchanged.
+raise_descriptor_limit = (a: Alloc) {
+    a.realloc<Limit>(null_ptr<Limit>(), 1).match({
+        Err(_)   => (),
+        Ok(cell) => (Resources.getrlimit(Resources.RLIMIT_NOFILE, cell) == 0).then(() {
+            current   = cell.read(0);
+            want: u64 = MAX_WATCHES.to_u64() + 1024;
+            target    = (current.rlim_max < want).match({ true => current.rlim_max, false => want });
+            (current.rlim_cur < target).then(() {
+                cell.write(
+                    0,
+                    Limit(rlim_cur: target, rlim_max: current.rlim_max)
+                );
+                Resources.setrlimit(Resources.RLIMIT_NOFILE, cell);
+            });
+        }),
+    });
+}
 
 KqueueWatch* = {
     queue :: i32 = -1,
@@ -61,8 +87,18 @@ KqueueWatch* = {
                     fflags: Kq.NOTE_WRITE + Kq.NOTE_DELETE + Kq.NOTE_RENAME + Kq.NOTE_EXTEND + Kq.NOTE_ATTRIB + Kq.NOTE_LINK
                 );
                 self.events.write(0, change);
-                (Kq.kevent(self.queue, self.events, 1, null_ptr<Kevent>(), 0, self.zero) == 0).match({
-                    true  => { self.fds.write(self.watched, fd); self.watched = self.watched + 1; },
+                (Kq.kevent(
+                    self.queue,
+                    self.events,
+                    1,
+                    null_ptr<Kevent>(),
+                    0,
+                    self.zero
+                ) == 0).match({
+                    true  => { self.fds.write(
+                        self.watched,
+                        fd
+                    ); self.watched = self.watched + 1; },
                     false => { Unix.close(fd); },
                 });
             });
@@ -72,12 +108,16 @@ KqueueWatch* = {
 
 KqueueWatch.impl(Watch, {
     open = (self :: @Self, a: Alloc) bool {
-        buffers = a.realloc<i32>(null_ptr<i32>(), MAX_WATCHES).match({
-            Err(_) => false,
+        raise_descriptor_limit(a);
+        buffers    = a.realloc<i32>(null_ptr<i32>(), MAX_WATCHES).match({
+            Err(_)  => false,
             Ok(fds) => a.realloc<Kevent>(null_ptr<Kevent>(), EVENTS).match({
-                Err(_) => false,
-                Ok(events) => a.realloc<Timespec>(null_ptr<Timespec>(), 1).match({
-                    Err(_) => false,
+                Err(_)     => false,
+                Ok(events) => a.realloc<Timespec>(
+                    null_ptr<Timespec>(),
+                    1
+                ).match({
+                    Err(_)   => false,
                     Ok(zero) => {
                         zero.write(0, Timespec());
                         self.fds = fds; self.events = events; self.zero = zero;
@@ -93,7 +133,9 @@ KqueueWatch.impl(Watch, {
     // Closing a descriptor removes its kevent registrations.
     reset = (self :: @Self) { self.release(); }
 
-    add = (self :: @Self, path: str, kind: EntryKind, root: bool) { self.watch_path(path); }
+    add = (self :: @Self, path: str, kind: EntryKind, root: bool) { self.watch_path(
+        path
+    ); }
 
     count = (self: @Self) usize { self.watched }
 
@@ -102,7 +144,14 @@ KqueueWatch.impl(Watch, {
     drain = (self :: @Self) bool {
         seen ::= false;
         loop((h) {
-            n = Kq.kevent(self.queue, null_ptr<Kevent>(), 0, self.events, EVENTS.to_u64().to_i32().value_or(64), self.zero);
+            n = Kq.kevent(
+                self.queue,
+                null_ptr<Kevent>(),
+                0,
+                self.events,
+                EVENTS.to_u64().to_i32().value_or(64),
+                self.zero
+            );
             (n <= 0).then(() { h.break(); });
             seen = true;
         });

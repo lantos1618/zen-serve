@@ -40,7 +40,11 @@ InotifyWatch* = {
     }
 
     watch_path = (self :: @Self, path: str) {
-        rc = Inotify.inotify_add_watch(self.queue, path.ptr().to<c_char>(), self.mask());
+        rc = Inotify.inotify_add_watch(
+            self.queue,
+            path.ptr().to<c_char>(),
+            self.mask()
+        );
         (rc >= 0).then(() { self.watched = self.watched + 1; });
     }
 }
@@ -51,7 +55,9 @@ InotifyWatch.impl(Watch, {
             Err(_)     => false,
             Ok(buffer) => {
                 self.buffer = buffer;
-                self.queue  = Inotify.inotify_init1(Inotify.IN_NONBLOCK + Inotify.IN_CLOEXEC);
+                self.queue  = Inotify.inotify_init1(
+                    Inotify.IN_NONBLOCK + Inotify.IN_CLOEXEC
+                );
                 self.queue >= 0
             },
         })

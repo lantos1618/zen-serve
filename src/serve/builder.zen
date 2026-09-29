@@ -19,30 +19,54 @@ BuildOutcome* = { ok*: bool, diagnostics*: str, millis*: u64 }
 // Runs `command` through /bin/sh in `project`. Success is exit status zero;
 // on failure the diagnostics are the command's stderr then stdout (Zen
 // reports errors on stderr), prefixed with the command and its status.
-run_build* = (env: Env, a: Alloc, project: str, command: str) Res<BuildOutcome, AllocError> {
+run_build* = (
+    env     : Env,
+    a       : Alloc,
+    project : str,
+    command : str
+) Res<BuildOutcome, AllocError> {
     started = env.clock.since_start().millis_of();
     result  = env.proc.run(a, project, command);
     millis  = env.clock.since_start().millis_of() - started;
     result.match({
         Err(_)     => {
-            text = a.String("$ {}\ncould not start /bin/sh for the build command\n", command).try();
-            Ok(BuildOutcome(ok: false, diagnostics: text.view(), millis: millis))
+            text = a.String(
+                "$ {}\ncould not start /bin/sh for the build command\n",
+                command
+            ).try();
+            Ok(BuildOutcome(
+                ok: false,
+                diagnostics: text.view(),
+                millis: millis
+            ))
         },
         Ok(output) => (output.code == 0).match({
-            true  => Ok(BuildOutcome(ok: true, diagnostics: "", millis: millis)),
+            true  => Ok(BuildOutcome(
+                ok: true,
+                diagnostics: "",
+                millis: millis
+            )),
             false => {
-                text ::= a.String("$ {}\nexit status {}\n\n", command, output.code).try();
+                text ::= a.String(
+                    "$ {}\nexit status {}\n\n",
+                    command,
+                    output.code
+                ).try();
                 text.add(output.err.view()).try();
                 (output.out.len() > 0).then(() {
                     (text.len() > 0 && !text.view().ends_with("\n")).then(() { text.add('\n').try(); });
                     text.add(output.out.view()).try();
                 });
-                view = text.view();
+                view    = text.view();
                 clipped = (view.len > MAX_DIAGNOSTICS).match({
                     true  => view.slice(0, MAX_DIAGNOSTICS),
                     false => view,
                 });
-                Ok(BuildOutcome(ok: false, diagnostics: clipped, millis: millis))
+                Ok(BuildOutcome(
+                    ok: false,
+                    diagnostics: clipped,
+                    millis: millis
+                ))
             },
         }),
     })
@@ -60,7 +84,10 @@ Builder*<B: TransportBackend> = {
 
     ring = (self :: @Self, ctx: Context) {
         self.byte.is_null().then(() {
-            self.byte = ctx.alloc.raw(8, 8).match({ Ok(p) => p, Err(_) => null_ptr<u8>() });
+            self.byte = ctx.alloc.raw(
+                8,
+                8
+            ).match({ Ok(p) => p, Err(_) => null_ptr<u8>() });
         });
         (!self.byte.is_null()).then(() { self.wake.ring(self.byte); });
     }
@@ -69,19 +96,32 @@ Builder*<B: TransportBackend> = {
         self.builds = self.builds + 1;
         self.server.building(self.server).ignore();
         self.ring(ctx);
-        ctx.env.out.println("zen-serve: rebuilding ({} change notification(s))", changes).ignore(); ctx.env.out.flush().ignore();
+        ctx.env.out.println(
+            "zen-serve: rebuilding ({} change notification(s))",
+            changes
+        ).ignore(); ctx.env.out.flush().ignore();
         scratch = ctx.env.mem.alloc();
         run_build(ctx.env, scratch, self.project, self.command).match({
             Err(_)      => (),
             Ok(outcome) => {
                 outcome.ok.match({
                     true  => {
-                        ctx.env.out.println("zen-serve: build ok in {} ms", outcome.millis).ignore(); ctx.env.out.flush().ignore();
+                        ctx.env.out.println(
+                            "zen-serve: build ok in {} ms",
+                            outcome.millis
+                        ).ignore(); ctx.env.out.flush().ignore();
                         self.server.built(self.server).ignore();
                     },
                     false => {
-                        ctx.env.out.println("zen-serve: build failed in {} ms\n{}", outcome.millis, outcome.diagnostics).ignore(); ctx.env.out.flush().ignore();
-                        self.server.failed(self.server, outcome.diagnostics).ignore();
+                        ctx.env.out.println(
+                            "zen-serve: build failed in {} ms\n{}",
+                            outcome.millis,
+                            outcome.diagnostics
+                        ).ignore(); ctx.env.out.flush().ignore();
+                        self.server.failed(
+                            self.server,
+                            outcome.diagnostics
+                        ).ignore();
                     },
                 });
                 self.ring(ctx);
@@ -98,7 +138,7 @@ Builder.impl(Actor, {
     }
     run = (self :: @Self, ctx: Context, me: Ref<Builder<B>>) {
         self.queue.run().then(() {
-            changes = self.pending_changes;
+            changes              = self.pending_changes;
             self.pending_changes = 0;
             self.build(ctx, changes);
         });

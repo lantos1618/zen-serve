@@ -33,7 +33,8 @@ hex_value = (ch: u8) Res<u8> {
 
 // Percent-decodes one segment into `out`. A decoded '/', '\', or NUL would
 // let a single segment name a different path, so they are refused.
-decode_segment = (segment: str, out :: String) Res<(), AllocError | TargetError> {
+decode_segment = (segment: str, out :: String) Res<(), AllocError
+    | TargetError> {
     at ::= 0;
     loop(at < segment.len, (h) {
         ch = segment.index(at);
@@ -43,7 +44,9 @@ decode_segment = (segment: str, out :: String) Res<(), AllocError | TargetError>
                 high = hex_value(segment.index(at + 1)).ok_or(TargetError.Malformed).try();
                 low  = hex_value(segment.index(at + 2)).ok_or(TargetError.Malformed).try();
                 byte = high * 16 + low;
-                (byte != '/' && byte != '\\' && byte != 0).ensure(TargetError.Traversal).try();
+                (byte != '/' && byte != '\\' && byte != 0).ensure(
+                    TargetError.Traversal
+                ).try();
                 out.add(byte).try();
                 at = at + 3;
             },
@@ -71,11 +74,11 @@ relative_path* = (a: Alloc, target: str) Res<String, AllocError | TargetError> {
         true  => Ok(out),
         false => {
             segment ::= a.String().try();
-            parts ::= 0;
+            parts   ::= 0;
             total = path.count("/") + 1;
             path.split('/').loop((raw) {
                 parts = parts + 1;
-                last = parts == total;
+                last  = parts == total;
                 segment.clear();
                 decode_segment(raw, segment).try();
                 name = segment.view();

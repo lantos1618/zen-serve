@@ -37,20 +37,33 @@ Watcher*<W: Watch, B: TransportBackend> = {
 
 Watcher.impl(Actor, {
     begin = (self :: @Self, ctx: Context, me: Ref<Watcher<W, B>>) {
-        self.poll = ctx.alloc.realloc<PollFd>(null_ptr<PollFd>(), 1).match({ Ok(p) => p, Err(_) => null_ptr<PollFd>() });
-        opened = self.backend.open(ctx.alloc);
+        self.poll  = ctx.alloc.realloc<PollFd>(
+            null_ptr<PollFd>(),
+            1
+        ).match({ Ok(p) => p, Err(_) => null_ptr<PollFd>() });
+        opened     = self.backend.open(ctx.alloc);
         self.armed = opened && !self.poll.is_null() && self.rearm(ctx).match({
-            Ok(count) => { ctx.env.out.println("zen-serve: watching {} files and directories", count).ignore(); ctx.env.out.flush().ignore(); true },
+            Ok(count) => { ctx.env.out.println(
+                "zen-serve: watching {} files and directories",
+                count
+            ).ignore(); ctx.env.out.flush().ignore(); true },
             Err(_)    => false,
         });
-        (!self.armed).then(() { ctx.env.out.println("zen-serve: file watching is unavailable").ignore(); ctx.env.out.flush().ignore(); });
+        (!self.armed).then(
+            () { ctx.env.out.println(
+                "zen-serve: file watching is unavailable"
+            ).ignore(); ctx.env.out.flush().ignore(); }
+        );
         self.armed.then(() { me.turn(me).ignore(); });
     }
 
     turn = (self :: @Self, ctx: Context, me: Ref<Watcher<W, B>>) {
-        now = ctx.env.clock.since_start().millis_of();
+        now     = ctx.env.clock.since_start().millis_of();
         timeout = self.debounce.wait_ms(now, IDLE_MS);
-        self.poll.write(0, PollFd(fd: self.backend.fd(), events: Polling.POLLIN, revents: 0));
+        self.poll.write(
+            0,
+            PollFd(fd: self.backend.fd(), events: Polling.POLLIN, revents: 0)
+        );
         (Polling.poll(self.poll, 1, timeout) > 0 && self.backend.drain()).then(() {
             self.debounce.touch(ctx.env.clock.since_start().millis_of());
             // New files and directories need registrations of their own.

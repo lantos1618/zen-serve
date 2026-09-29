@@ -19,7 +19,7 @@ TransportBackend = http.server_core
 Shard, Admission, StartError = workers.worker
 relative_path, canonical, contains, TargetError = serve.paths
 content_type, is_html = serve.mime
-Hub, hub = serve.events
+Hub, hub, HEARTBEAT = serve.events
 client_script, inject_client, CLIENT_PATH, EVENTS_PATH = serve.client
 
 Native = c.bind("string.h", {
@@ -74,8 +74,20 @@ Conn = {
 }
 
 empty_conn = () Conn {
-    Conn(transport: null_ptr<()>(), input: null_ptr<u8>(), used: 0, out: null_ptr<u8>(), len: 0, sent: 0,
-         capacity: 0, streaming: false, closing: false, broken: false, active: 0, runnable: false)
+    Conn(
+        transport: null_ptr<()>(),
+        input: null_ptr<u8>(),
+        used: 0,
+        out: null_ptr<u8>(),
+        len: 0,
+        sent: 0,
+        capacity: 0,
+        streaming: false,
+        closing: false,
+        broken: false,
+        active: 0,
+        runnable: false
+    )
 }
 
 // Bytes moved by a positive transport io result. A free function: the
@@ -109,13 +121,17 @@ head_of = (bytes: str) Res<Parsed, Code> {
             Ok(Parsed.Partial)
         },
         false => {
-            head  = bytes.slice(0, end - 4);
-            first = head.find("\r\n").value_or(head.len);
-            line  = head.slice(0, first);
+            head   = bytes.slice(0, end - 4);
+            first  = head.find("\r\n").value_or(head.len);
+            line   = head.slice(0, first);
             method = line.split_once(' ').ok_or(Code.BadRequest).try();
             target = method.after.split_once(' ').ok_or(Code.BadRequest).try();
-            (method.before.len > 0 && target.before.len > 0).ensure(Code.BadRequest).try();
-            (target.after == "HTTP/1.1" || target.after == "HTTP/1.0").ensure(Code.BadRequest).try();
+            (method.before.len > 0 && target.before.len > 0).ensure(
+                Code.BadRequest
+            ).try();
+            (target.after == "HTTP/1.1" || target.after == "HTTP/1.0").ensure(
+                Code.BadRequest
+            ).try();
             close ::= target.after == "HTTP/1.0";
             body  ::= false;
             (first < head.len).then(() {
@@ -129,7 +145,13 @@ head_of = (bytes: str) Res<Parsed, Code> {
                     field.before.eq_ignore_case("transfer-encoding").then(() { body = true; });
                 });
             });
-            Ok(Parsed.Complete(Head(method: method.before, target: target.before, size: end, close: close, body: body)))
+            Ok(Parsed.Complete(Head(
+                method: method.before,
+                target: target.before,
+                size: end,
+                close: close,
+                body: body
+            )))
         },
     })
 }
@@ -181,19 +203,25 @@ DevShard*<B: TransportBackend> = {
         ok ::= !(c.streaming && pending + bytes.len > STREAM_BACKLOG);
         (ok && c.len + bytes.len > c.capacity).then(() {
             want ::= c.capacity * 2;
-            (want < pending + bytes.len).then(() { want = pending + bytes.len; });
+            (want < pending + bytes.len).then(
+                () { want = pending + bytes.len; }
+            );
             (want < 4096).then(() { want = 4096; });
             self.alloc().raw(want, 16).match({
                 Err(_)    => { ok = false; },
                 Ok(fresh) => {
-                    (pending > 0).then(() { fresh.copy_from(c.out.offset(c.sent), pending); });
+                    (pending > 0).then(
+                        () { fresh.copy_from(c.out.offset(c.sent), pending); }
+                    );
                     (!c.out.is_null()).then(() { self.alloc().free(c.out); });
                     c.out = fresh; c.capacity = want; c.sent = 0; c.len = pending;
                 },
             });
         });
         ok.then(() {
-            (bytes.len > 0).then(() { c.out.offset(c.len).copy_from(bytes.ptr(), bytes.len); });
+            (bytes.len > 0).then(
+                () { c.out.offset(c.len).copy_from(bytes.ptr(), bytes.len); }
+            );
             c.len = c.len + bytes.len;
         });
         ok
@@ -267,12 +295,27 @@ DevShard*<B: TransportBackend> = {
     serve_file = (self :: @Self, c :: Conn, a: Alloc, target: str, head_only: bool) Res<(), AllocError> {
         self.choose(a, target).match({
             Err(e)   => e.match({
-                OutOfMemory => Err(AllocError.OutOfMemory),
-                Success     => self.refuse(c, a, Code.NotFound, head_only),
-                BadRequest  => self.refuse(c, a, Code.BadRequest, head_only),
-                Forbidden   => self.refuse(c, a, Code.Forbidden, head_only),
-                NotFound    => self.refuse(c, a, Code.NotFound, head_only),
-                MethodNotAllowed => self.refuse(c, a, Code.MethodNotAllowed, head_only),
+                OutOfMemory      => Err(AllocError.OutOfMemory),
+                Success          => self.refuse(c, a, Code.NotFound, head_only),
+                BadRequest       => self.refuse(
+                    c,
+                    a,
+                    Code.BadRequest,
+                    head_only
+                ),
+                Forbidden        => self.refuse(
+                    c,
+                    a,
+                    Code.Forbidden,
+                    head_only
+                ),
+                NotFound         => self.refuse(c, a, Code.NotFound, head_only),
+                MethodNotAllowed => self.refuse(
+                    c,
+                    a,
+                    Code.MethodNotAllowed,
+                    head_only
+                ),
             }),
             Ok(file) => self.files.read(a, file).match({
                 Err(_)    => self.refuse(c, a, Code.NotFound, head_only),
@@ -280,9 +323,23 @@ DevShard*<B: TransportBackend> = {
                     true  => {
                         page ::= a.String().try();
                         inject_client(page, bytes.view()).try();
-                        self.simple(c, a, Code.Success, content_type(file), page.view(), head_only)
+                        self.simple(
+                            c,
+                            a,
+                            Code.Success,
+                            content_type(file),
+                            page.view(),
+                            head_only
+                        )
                     },
-                    false => self.simple(c, a, Code.Success, content_type(file), bytes.view(), head_only),
+                    false => self.simple(
+                        c,
+                        a,
+                        Code.Success,
+                        content_type(file),
+                        bytes.view(),
+                        head_only
+                    ),
                 }),
             }),
         })
@@ -290,29 +347,52 @@ DevShard*<B: TransportBackend> = {
 
     subscribe = (self :: @Self, c :: Conn, a: Alloc) Res<(), AllocError> {
         c.streaming = true;
-        greeting = self.hub.read(0).greeting(a).try();
+        greeting    = self.hub.read(0).greeting(a).try();
         (self.enqueue(c, STREAM_HEADERS) && self.enqueue(c, greeting.view())).ensure(AllocError.OutOfMemory)
     }
 
     // Answers one complete request. The scratch arena lives for this call.
     respond = (self :: @Self, c :: Conn, head: Head) Res<(), AllocError> {
-        scratch = self.mem.alloc();
+        scratch   = self.mem.alloc();
         c.closing = c.closing || head.close || head.body;
         head_only = head.method == "HEAD";
         loop((h) {
             head.body.then(() {
-                self.simple(c, scratch, Code.BadRequest, "text/plain; charset=utf-8", "request bodies are not accepted\n", false).try();
+                self.simple(
+                    c,
+                    scratch,
+                    Code.BadRequest,
+                    "text/plain; charset=utf-8",
+                    "request bodies are not accepted\n",
+                    false
+                ).try();
                 h.break();
             });
             (head.method != "GET" && !head_only).then(() {
-                self.simple(c, scratch, Code.MethodNotAllowed, "text/plain; charset=utf-8", "method not allowed\n", false).try();
+                self.simple(
+                    c,
+                    scratch,
+                    Code.MethodNotAllowed,
+                    "text/plain; charset=utf-8",
+                    "method not allowed\n",
+                    false
+                ).try();
                 h.break();
             });
-            (head.target == EVENTS_PATH).then(() { self.subscribe(c, scratch).try(); h.break(); });
+            (head.target == EVENTS_PATH).then(
+                () { self.subscribe(c, scratch).try(); h.break(); }
+            );
             (head.target == CLIENT_PATH).then(() {
                 script ::= scratch.String().try();
                 client_script(script).try();
-                self.simple(c, scratch, Code.Success, "text/javascript; charset=utf-8", script.view(), head_only).try();
+                self.simple(
+                    c,
+                    scratch,
+                    Code.Success,
+                    "text/javascript; charset=utf-8",
+                    script.view(),
+                    head_only
+                ).try();
                 h.break();
             });
             self.serve_file(c, scratch, head.target, head_only).try();
@@ -332,11 +412,16 @@ DevShard*<B: TransportBackend> = {
             (steps > 64).then(() { again = true; h.break(); });
             (c.sent < c.len).match({
                 true  => {
-                    n = self.backend.io(c.transport, c.out.offset(c.sent), c.len - c.sent, 1);
+                    n = self.backend.io(
+                        c.transport,
+                        c.out.offset(c.sent),
+                        c.len - c.sent,
+                        1
+                    );
                     (n == -3).then(() { again = true; h.break(); });
                     (n == -2).then(() { h.break(); });
                     (n > 0).ensure(Code.BadRequest).try();
-                    c.sent = c.sent + transferred(n);
+                    c.sent   = c.sent + transferred(n);
                     c.active = self.now;
                 },
                 false => {
@@ -352,25 +437,34 @@ DevShard*<B: TransportBackend> = {
                         parsed = parse_head(str_at(c.input, c.used));
                     });
                     parsed.match({
-                        Invalid(code) => {
+                        Invalid(code)  => {
                             c.closing = true;
-                            scratch = self.mem.alloc();
+                            scratch   = self.mem.alloc();
                             self.refuse(c, scratch, code, false).try();
                         },
                         Complete(head) => {
                             self.respond(c, head).try();
                             c.used = c.used - head.size;
-                            Native.memmove(c.input, c.input.offset(head.size), c.used);
+                            Native.memmove(
+                                c.input,
+                                c.input.offset(head.size),
+                                c.used
+                            );
                         },
-                        Partial => {
+                        Partial        => {
                             // Subscribers send nothing after their request;
                             // reading still reports when the browser leaves.
                             c.streaming.then(() { c.used = 0; });
-                            n = self.backend.io(c.transport, c.input.offset(c.used), INPUT - c.used, 0);
+                            n = self.backend.io(
+                                c.transport,
+                                c.input.offset(c.used),
+                                INPUT - c.used,
+                                0
+                            );
                             (n == -3).then(() { again = true; h.break(); });
                             (n == -2).then(() { h.break(); });
                             (n > 0).ensure(Code.BadRequest).try();
-                            c.used = c.used + transferred(n);
+                            c.used   = c.used + transferred(n);
                             c.active = self.now;
                         },
                     });
@@ -426,7 +520,9 @@ DevShard*<B: TransportBackend> = {
         count ::= 0;
         Range(0, SLOTS).loop((i) {
             c = self.conns.read(i);
-            (!c.transport.is_null() && c.streaming).then(() { count = count + 1; });
+            (!c.transport.is_null() && c.streaming).then(
+                () { count = count + 1; }
+            );
         });
         count
     }
@@ -434,10 +530,10 @@ DevShard*<B: TransportBackend> = {
     install = (self :: @Self, reactor :: Readiness, slot: usize, transport: Ptr<()>) {
         c ::= self.conns.read(slot);
         c.transport = transport;
-        c.used = 0; c.len = 0; c.sent = 0; c.streaming = false; c.closing = false; c.runnable = false;
-        c.active = self.now;
+        c.used      = 0; c.len = 0; c.sent = 0; c.streaming = false; c.closing = false; c.runnable = false;
+        c.active  = self.now;
         self.open = self.open + 1;
-        want = self.backend.requested(transport);
+        want      = self.backend.requested(transport);
         reactor.add(self.backend.fd(transport), slot, interest_of(want)).match({
             Ok(_)  => self.backend.mark_armed(transport, want),
             Err(_) => self.release(c),
@@ -463,28 +559,50 @@ DevShard.impl(Shard, {
     slots = (self: @Self) usize { SLOTS + 1 }
 
     start = (self :: @Self, fixed: Alloc, churn: Alloc, reactor :: Readiness, admission: Admission, clock: Clock) Res<(), StartError> {
-        cell = fixed.realloc<Alloc>(null_ptr<Alloc>(), 1).try(StartError.Allocation);
+        cell = fixed.realloc<Alloc>(
+            null_ptr<Alloc>(),
+            1
+        ).try(StartError.Allocation);
         cell.write(0, churn);
         self.churn = cell;
-        self.now = clock.since_start().seconds_of();
-        self.beat = self.now;
-        conns = fixed.realloc<Conn>(null_ptr<Conn>(), SLOTS).try(StartError.Allocation);
+        self.now   = clock.since_start().seconds_of();
+        self.beat  = self.now;
+        conns      = fixed.realloc<Conn>(
+            null_ptr<Conn>(),
+            SLOTS
+        ).try(StartError.Allocation);
         Range(0, SLOTS).loop((i) { conns.write(i, empty_conn()); });
         self.conns = conns;
-        state = fixed.realloc<Hub>(null_ptr<Hub>(), 1).try(StartError.Allocation);
+        state      = fixed.realloc<Hub>(
+            null_ptr<Hub>(),
+            1
+        ).try(StartError.Allocation);
         state.write(0, hub(fixed).try(StartError.Allocation));
         self.hub = state;
         Range(0, SLOTS).loop((i) {
             c ::= conns.read(i);
-            c.input = fixed.realloc<u8>(null_ptr<u8>(), INPUT).try(StartError.Allocation);
+            c.input = fixed.realloc<u8>(
+                null_ptr<u8>(),
+                INPUT
+            ).try(StartError.Allocation);
             conns.write(i, c);
         });
-        self.ready = fixed.realloc<usize>(null_ptr<usize>(), 2 * SLOTS).try(StartError.Allocation);
-        self.batch = fixed.realloc<usize>(null_ptr<usize>(), 2 * SLOTS).try(StartError.Allocation);
-        host = self.host.c_text(fixed).try(StartError.Allocation);
+        self.ready    = fixed.realloc<usize>(
+            null_ptr<usize>(),
+            2 * SLOTS
+        ).try(StartError.Allocation);
+        self.batch    = fixed.realloc<usize>(
+            null_ptr<usize>(),
+            2 * SLOTS
+        ).try(StartError.Allocation);
+        host          = self.host.c_text(fixed).try(StartError.Allocation);
         self.listener = self.backend.listen(churn, host.ptr(), self.port);
         (!self.listener.is_null()).ensure(StartError.Listen).try();
-        reactor.add(self.backend.listener_fd(self.listener), SLOTS, Interest.Read).try(StartError.Poll);
+        reactor.add(
+            self.backend.listener_fd(self.listener),
+            SLOTS,
+            Interest.Read
+        ).try(StartError.Poll);
         Ok(())
     }
 
@@ -495,14 +613,16 @@ DevShard.impl(Shard, {
             true  => self.accept_all(reactor),
             false => (slot < SLOTS).then(() {
                 c ::= self.conns.read(slot);
-                (!c.transport.is_null()).then(() { self.mark(slot, c); self.conns.write(slot, c); });
+                (!c.transport.is_null()).then(
+                    () { self.mark(slot, c); self.conns.write(slot, c); }
+                );
             }),
         });
     }
 
     run = (self :: @Self, reactor :: Readiness, clock: Clock) bool {
         self.now = clock.since_start().seconds_of();
-        count = self.queued;
+        count    = self.queued;
         (count > 0).then(() { self.batch.copy_from(self.ready, count); });
         self.queued = 0;
         Range(0, count).loop((k) {
@@ -510,23 +630,34 @@ DevShard.impl(Shard, {
             c ::= self.conns.read(slot);
             (!c.transport.is_null() && c.runnable).then(() {
                 c.runnable = false;
-                again ::= false;
+                again  ::= false;
                 failed ::= false;
-                self.drive(c).match({ Ok(more) => { again = more; }, Err(_) => { failed = true; } });
+                self.drive(
+                    c
+                ).match({ Ok(more) => { again = more; }, Err(_) => { failed = true; } });
                 failed.then(() {
                     reactor.remove(self.backend.fd(c.transport)).ignore();
                     self.release(c);
                 });
                 (!c.transport.is_null()).then(() {
-                    want: i32 = self.backend.requested(c.transport);
+                    want: i32    = self.backend.requested(c.transport);
                     current: i32 = self.backend.armed(c.transport);
                     (want != current).then(() {
-                        reactor.modify(self.backend.fd(c.transport), slot, interest_of(want)).match({
-                            Ok(_)  => self.backend.mark_armed(c.transport, want),
+                        reactor.modify(
+                            self.backend.fd(c.transport),
+                            slot,
+                            interest_of(want)
+                        ).match({
+                            Ok(_)  => self.backend.mark_armed(
+                                c.transport,
+                                want
+                            ),
                             Err(_) => self.release(c),
                         });
                     });
-                    (!c.transport.is_null() && again).then(() { self.mark(slot, c); });
+                    (!c.transport.is_null() && again).then(
+                        () { self.mark(slot, c); }
+                    );
                 });
                 self.conns.write(slot, c);
             });
@@ -537,7 +668,7 @@ DevShard.impl(Shard, {
     adopt = (self :: @Self, churn: Alloc, reactor :: Readiness, fd: i32) { }
 
     tick = (self :: @Self, reactor :: Readiness, now: u64) {
-        self.now = now;
+        self.now  = now;
         heartbeat = now >= self.beat + HEARTBEAT_SECONDS;
         heartbeat.then(() { self.beat = now; });
         Range(0, SLOTS).loop((i) {
@@ -545,7 +676,7 @@ DevShard.impl(Shard, {
             (!c.transport.is_null()).then(() {
                 c.streaming.match({
                     true  => heartbeat.then(() {
-                        self.enqueue(c, ": ping\n\n").then(() { self.mark(i, c); });
+                        self.enqueue(c, HEARTBEAT).then(() { self.mark(i, c); });
                     }),
                     false => (now >= c.active + IDLE_SECONDS).then(() {
                         reactor.remove(self.backend.fd(c.transport)).ignore();

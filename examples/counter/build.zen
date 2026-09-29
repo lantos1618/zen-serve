@@ -3,8 +3,17 @@ Builder, BuildError, Codegen = std.build
 // page: build/web/{index.html, runtime.js, app.js}. zen-ui is a sibling
 // checkout; this example only owns src/main.zen.
 build = (b :: Builder) Res<(), BuildError> {
-    ui = b.lib("ui", {src: Path("../../../zen-ui/src/ui.zen"), libs: [], paths: []}).try();
-    web = b.lib("ui_web", {src: Path("../../../zen-ui/src/web_host.zen"), libs: [], paths: []}).try();
-    b.exe("counter", {src: Path("src/main.zen"), deps: [ui, web], backend: Codegen.Js, web: true, out: Ok(Path("build/web"))}).try();
+    ui  = b.lib(
+        "ui",
+        {src: Path("../../../zen-ui/src/ui.zen"), libs: [], paths: []}
+    ).try();
+    web = b.lib(
+        "ui_web",
+        {src: Path("../../../zen-ui/src/web_host.zen"), libs: [], paths: []}
+    ).try();
+    b.exe(
+        "counter",
+        {src: Path("src/main.zen"), deps: [ui, web], backend: Codegen.Js, web: true, out: Ok(Path("build/web"))}
+    ).try();
     Ok(())
 }

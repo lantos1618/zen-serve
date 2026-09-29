@@ -16,7 +16,7 @@ main = (env: Env) Res<i32, AllocError | Error> {
     view ::= View.create(arena, 16, display.width, display.height).try();
     panel = view.box(0, Box(id: "panel", height: 520.0, padding: 24.0, gap: 12.0, fill: true)).try();
     view.set_appearance(panel, Appearance(background: Color(r: 0.09, g: 0.10, b: 0.13))).try();
-    title = view.text(panel, Text(id: "title", value: "ZEN UI", height: 46.0, size: 30.0)).try();
+    title = view.text(panel, Text(id: "title", value: "ZEN UI · live reload", height: 46.0, size: 30.0)).try();
     view.set_appearance(title, Appearance(foreground: Color(r: 0.55, g: 0.80, b: 1.0))).try();
     details = arena.String("Running on {} · compiled by Zen's JS backend", os).try();
     about = view.text(panel, Text(id: "platform", value: details.view(), height: 28.0, size: 15.0)).try();

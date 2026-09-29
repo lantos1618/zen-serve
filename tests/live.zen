@@ -1,0 +1,365 @@
+// End-to-end tests against a running dev server, in-process: the real
+// Server, Builder and Watcher actors, kqueue watching, and real builds by
+// the Zen compiler named in $ZEN (with $ZEN_STD) of a fixture project under
+// build/live-fixture. Clients are plain TCP sockets speaking HTTP/1.1.
+//
+// Covered: static serving with content types and the injected client,
+// traversal and symlink-escape refusals, two concurrent event-stream
+// clients, one coalesced build per burst of edits, and build failure ->
+// build-error event (also replayed to a late client) -> recovery reload.
+Alloc, AllocError, Ptr, null_ptr = std.mem
+str, String, str_at = std.text
+Socket = std.net.socket
+Config, launch, Running = serve.app
+KqueueWatch = serve.watch_kqueue
+PlainBackend = http.plain_transport
+canonical = serve.paths
+run_build = serve.builder
+
+PollFd = c.record("poll.h", "struct pollfd", { fd: i32, events: i16, revents: i16 })
+Polling = c.bind("poll.h", {
+    POLLIN: i16
+    poll = (fds: Ptr<PollFd>, count: u32, timeout_ms: i32) i32
+})
+Links = c.bind("unistd.h", {
+    symlink = (target: Ptr<c_char>, path: Ptr<c_char>) i32
+    unlink = (path: Ptr<c_char>) i32
+    usleep = (micros: u32) i32
+})
+
+PORT: u16 = 18931
+FIXTURE: str = "build/live-fixture"
+
+LiveError = Failed | Setup
+
+// One client connection with everything it has received so far.
+Client = {
+    socket :: Socket,
+    seen :: String,
+    buffer: Ptr<u8>,
+    poll: Ptr<PollFd>,
+
+    // Reads until `needle` occurs at or after `from`, or `timeout_ms` passes.
+    // Returns the offset just past the needle.
+    wait_for = (self :: @Self, needle: str, from: usize, timeout_ms: i32) Res<usize> {
+        waited ::= 0;
+        found: Res<usize> = loop((h) {
+            (from <= self.seen.len()).then(() {
+                self.seen.view().slice(from, self.seen.len()).find(needle).match({
+                    Ok(at) => h.break(from + at + needle.len),
+                    None   => (),
+                });
+            });
+            (waited >= timeout_ms).then(() { h.break(); });
+            self.poll.write(
+                0,
+                PollFd(
+                    fd: self.socket.handle().raw_handle(),
+                    events: Polling.POLLIN,
+                    revents: 0
+                )
+            );
+            ready  = Polling.poll(self.poll, 1, 50);
+            waited = waited + 50;
+            (ready > 0).then(() {
+                self.socket.handle().recv(self.buffer, 65536).match({
+                    Ok(n)  => {
+                        (n == 0).then(() { h.break(); });
+                        self.seen.add(str_at(self.buffer, n)).ignore();
+                    },
+                    Err(_) => h.break(),
+                });
+            });
+        });
+        found
+    }
+
+    count = (self: @Self, needle: str, from: usize) usize {
+        (from <= self.seen.len()).match({
+            true  => self.seen.view().slice(from, self.seen.len()).count(needle),
+            false => 0,
+        })
+    }
+}
+
+connect = (a: Alloc, request: str) Res<Client, AllocError | LiveError> {
+    socket ::= Socket.tcp_connect(a, "127.0.0.1", PORT).match({ Ok(s) => Ok(s), Err(_) => Err(LiveError.Setup) }).try();
+    socket.write(request).match({ Ok(_) => Ok(()), Err(_) => Err(LiveError.Setup) }).try();
+    buffer = a.realloc<u8>(null_ptr<u8>(), 65536).try();
+    poll   = a.realloc<PollFd>(null_ptr<PollFd>(), 1).try();
+    Ok(Client(
+        socket: consume socket,
+        seen: a.String().try(),
+        buffer: buffer,
+        poll: poll
+    ))
+}
+
+get = (a: Alloc, target: str) Res<Client, AllocError | LiveError> {
+    request = a.String(
+        "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        target
+    ).try();
+    client ::= connect(a, request.view()).try();
+    // `Connection: close` responses end at EOF.
+    client.wait_for("\0", 0, 3000).value_or(0);
+    Ok(client)
+}
+
+Checks = {
+    env: Env,
+    passed :: usize = 0,
+    failed :: usize = 0,
+
+    check = (self :: @Self, name: str, ok: bool) {
+        ok.match({
+            true  => { self.passed = self.passed + 1; self.env.out.println(
+                "ok {}",
+                name
+            ).ignore(); },
+            false => { self.failed = self.failed + 1; self.env.out.println(
+                "not ok {}",
+                name
+            ).ignore(); },
+        });
+        self.env.out.flush().ignore();
+    }
+}
+
+SOURCE_A: str = "main = (env: Env) {\n    println(\"hello from zen, version a\");\n}\n"
+SOURCE_B: str = "main = (env: Env) {\n    println(\"hello from zen, version b\");\n}\n"
+SOURCE_BROKEN: str = "main = (env: Env) {\n    println(\"unterminated\";\n}\n"
+PAGE: str = "<!doctype html>\n<html><head><title>fixture</title><script src=\"app.js\"></script></head><body>fixture</body></html>\n"
+BUILD: str = "Builder, BuildError, Codegen = std.build\nbuild = (b :: Builder) Res<(), BuildError> {\n    b.exe(\"site\", {src: Path(\"src/main.zen\"), deps: [], backend: Codegen.Js, out: Ok(Path(\"build/web/app.js\"))}).try();\n    Ok(())\n}\n"
+
+write = (env: Env, path: str, text: str) Res<(), LiveError> {
+    env.fs.write(path, text).match({ Ok(_) => Ok(()), Err(_) => Err(LiveError.Setup) })
+}
+
+// Waits long enough for the watcher to see an edit as its own burst.
+pause = (millis: u32) { Links.usleep(millis * 1000); }
+
+prepare = (env: Env, a: Alloc) Res<str, AllocError | LiveError> {
+    env.fs.mkdir("build").ignore();
+    env.fs.mkdir(FIXTURE).ignore();
+    Range(0, 5).loop((i) {
+        dir = [FIXTURE, "src", "web", "build", "build/web"];
+        (i > 0).then(() {
+            path = a.String("{}/{}", FIXTURE, dir[i]).try();
+            env.fs.mkdir(path.view()).ignore();
+        });
+    });
+    root = canonical(a, FIXTURE).try();
+    (root.len > 0).ensure(LiveError.Setup).try();
+    write(env, a.String("{}/build.zen", root).try().view(), BUILD).try();
+    write(env, a.String("{}/src/main.zen", root).try().view(), SOURCE_A).try();
+    write(env, a.String("{}/web/index.html", root).try().view(), PAGE).try();
+    write(
+        env,
+        a.String("{}/secret.txt", root).try().view(),
+        "outside every served root\n"
+    ).try();
+    write(
+        env,
+        a.String("{}/web/inside.txt", root).try().view(),
+        "inside\n"
+    ).try();
+    // One symlink that escapes the served roots and one that stays inside.
+    escape = a.String("{}/web/escape.txt", root).try();
+    inner  = a.String("{}/web/alias.txt", root).try();
+    Links.unlink(escape.view().c_text(a).try().ptr().to<c_char>());
+    Links.unlink(inner.view().c_text(a).try().ptr().to<c_char>());
+    Links.symlink(
+        "../secret.txt".c_text(a).try().ptr().to<c_char>(),
+        escape.view().c_text(a).try().ptr().to<c_char>()
+    );
+    Links.symlink(
+        "inside.txt".c_text(a).try().ptr().to<c_char>(),
+        inner.view().c_text(a).try().ptr().to<c_char>()
+    );
+    Ok(root)
+}
+
+main = (env: Env) Res<i32, AllocError | LiveError> {
+    a            = env.mem.alloc();
+    has_compiler = env.var("ZEN").match({ Ok(_) => true, None => false });
+    (!has_compiler).then(
+        () { env.out.println(
+            "live tests: set ZEN to a Zen compiler and ZEN_STD to its standard library"
+        ).ignore(); }
+    );
+    has_compiler.ensure(LiveError.Setup).try();
+    checks ::= Checks(env: env);
+    root    = prepare(env, a).try();
+    command = "\"${ZEN:-zen}\" build site";
+    first   = run_build(env, a, root, command).try();
+    checks.check("the fixture builds with $ZEN", first.ok);
+    (!first.ok).then(() { env.out.println("{}", first.diagnostics).ignore(); });
+    roots   = a.String("{}/build/web\n{}/web", root, root).try();
+    watch   = a.String("{}/src\n{}/build.zen", root, root).try();
+    config  = Config(
+        project: root,
+        target: "site",
+        host: "127.0.0.1",
+        port: PORT,
+        tls: false,
+        cert: "",
+        key: "",
+        build_cmd: command,
+        roots: roots.view(),
+        watch: watch.view(),
+        quiet_ms: 100
+    );
+    running = launch(env, a, config, KqueueWatch(), PlainBackend(), first.ok, first.diagnostics).match({ Ok(r) => Ok(r), Err(_) => Err(LiveError.Setup) }).try();
+    // Let the watcher arm before the first edit.
+    pause(300);
+
+    // Static serving.
+    index ::= get(a, "/").try();
+    page = index.seen.view();
+    checks.check(
+        "GET / answers 200 with text/html",
+        page.starts_with("HTTP/1.1 200 OK\r\n") && page.contains("Content-Type: text/html; charset=utf-8\r\n")
+    );
+    checks.check(
+        "responses are not cached",
+        page.contains("Cache-Control: no-store\r\n")
+    );
+    checks.check(
+        "the reload client is injected before </head>",
+        page.contains("<script src=\"/__zen/client.js\"></script></head>")
+    );
+    app ::= get(a, "/app.js").try();
+    checks.check(
+        "GET /app.js is text/javascript from the build output",
+        app.seen.view().contains("Content-Type: text/javascript; charset=utf-8\r\n") && app.seen.view().contains("use strict")
+    );
+    client ::= get(a, "/__zen/client.js").try();
+    checks.check(
+        "the client script opens the event stream",
+        client.seen.view().contains("new EventSource('/__zen/events')")
+    );
+    missing ::= get(a, "/nope.css").try();
+    checks.check(
+        "a missing file is 404",
+        missing.seen.view().starts_with("HTTP/1.1 404")
+    );
+    climb ::= get(a, "/../secret.txt").try();
+    checks.check(
+        "a .. segment is 403",
+        climb.seen.view().starts_with("HTTP/1.1 403")
+    );
+    encoded ::= get(a, "/%2e%2e/secret.txt").try();
+    checks.check(
+        "an encoded .. segment is 403",
+        encoded.seen.view().starts_with("HTTP/1.1 403")
+    );
+    absolute ::= get(a, "//etc/passwd").try();
+    checks.check(
+        "an absolute-looking target is 403",
+        absolute.seen.view().starts_with("HTTP/1.1 403")
+    );
+    escape ::= get(a, "/escape.txt").try();
+    checks.check(
+        "a symlink escaping the root is 403",
+        escape.seen.view().starts_with("HTTP/1.1 403") && !escape.seen.view().contains("outside every served root")
+    );
+    alias ::= get(a, "/alias.txt").try();
+    checks.check(
+        "a symlink inside the root is served",
+        alias.seen.view().starts_with("HTTP/1.1 200") && alias.seen.view().contains("inside")
+    );
+    post ::= connect(
+        a,
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    ).try();
+    post.wait_for("\0", 0, 2000).value_or(0);
+    checks.check("POST is 405", post.seen.view().starts_with("HTTP/1.1 405"));
+
+    // Two browser tabs.
+    events = "GET /__zen/events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n";
+    one ::= connect(a, events).try();
+    two ::= connect(a, events).try();
+    start_one = one.wait_for("event: hello\ndata: 1\n\n", 0, 3000).value_or(0);
+    start_two = two.wait_for("event: hello\ndata: 1\n\n", 0, 3000).value_or(0);
+    checks.check(
+        "both event streams open with text/event-stream and hello",
+        start_one > 0 && start_two > 0 && one.seen.view().contains(
+            "Content-Type: text/event-stream\r\n"
+        )
+    );
+
+    // An edit rebuilds and reloads both tabs.
+    write(env, a.String("{}/src/main.zen", root).try().view(), SOURCE_B).try();
+    after_one = one.wait_for("event: reload\ndata: 2\n\n", start_one, 10000).value_or(0);
+    after_two = two.wait_for("event: reload\ndata: 2\n\n", start_two, 10000).value_or(0);
+    checks.check(
+        "an edit sends building then reload to both clients",
+        after_one > 0 && after_two > 0 && one.count("event: building", start_one) == 1 && two.count("event: building", start_two) == 1
+    );
+    rebuilt ::= get(a, "/app.js").try();
+    checks.check(
+        "the reloaded bundle is the rebuilt one",
+        rebuilt.seen.view().contains("76657273696f6e2062") || rebuilt.seen.view().contains("version b")
+    );
+
+    // A burst of edits inside the debounce window is one build.
+    Range(0, 5).loop((i) {
+        text = (i % 2 == 0).match({ true => SOURCE_A, false => SOURCE_B });
+        write(env, a.String("{}/src/main.zen", root).try().view(), text).try();
+        pause(20);
+    });
+    burst_one = one.wait_for("event: reload\ndata: 3\n\n", after_one, 10000).value_or(0);
+    pause(800);
+    one.wait_for("event: reload\ndata: 4", burst_one, 300).value_or(0);
+    checks.check(
+        "five quick edits cause exactly one build",
+        burst_one > 0 && one.count("event: building", after_one) == 1 && one.count("event: reload", after_one) == 1
+    );
+
+    // A syntax error reaches both tabs as a build-error event.
+    write(
+        env,
+        a.String("{}/src/main.zen", root).try().view(),
+        SOURCE_BROKEN
+    ).try();
+    error_one       = one.wait_for("event: build-error\n", burst_one, 10000).value_or(0);
+    error_two       = two.wait_for("event: build-error\n", after_two, 10000).value_or(0);
+    diagnostics_one = one.wait_for("\n\n", error_one, 2000).value_or(0);
+    checks.check(
+        "a syntax error sends build-error with the compiler diagnostics to both clients",
+        error_one > 0 && error_two > 0 && diagnostics_one > 0 && one.seen.view().slice(error_one, diagnostics_one).contains("data: main.zen:")
+    );
+    late ::= connect(a, events).try();
+    late_error = late.wait_for("event: build-error\n", 0, 3000).value_or(0);
+    checks.check(
+        "a tab opened while the build is broken is shown the error",
+        late_error > 0 && late.seen.view().contains("event: hello\ndata: 3\n\n")
+    );
+
+    // Fixing it reloads every tab.
+    write(env, a.String("{}/src/main.zen", root).try().view(), SOURCE_A).try();
+    fixed_one  = one.wait_for("event: reload\ndata: 4\n\n", error_one, 10000).value_or(0);
+    fixed_two  = two.wait_for("event: reload\ndata: 4\n\n", error_two, 10000).value_or(0);
+    fixed_late = late.wait_for("event: reload\ndata: 4\n\n", late_error, 10000).value_or(0);
+    checks.check(
+        "recovery sends reload to all three clients",
+        fixed_one > 0 && fixed_two > 0 && fixed_late > 0
+    );
+    after = get(a, "/").try();
+    checks.check(
+        "the server still answers after the streams",
+        after.seen.view().starts_with("HTTP/1.1 200")
+    );
+
+    one.socket.close();
+    two.socket.close();
+    late.socket.close();
+    running.stop();
+    env.out.println(
+        "{} passed, {} failed",
+        checks.passed,
+        checks.failed
+    ).ignore();
+    Ok((checks.failed == 0).match({ true => 0, false => 1 }))
+}
