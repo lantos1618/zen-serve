@@ -1,0 +1,130 @@
+// Unit tests for the pure parts of zen-serve: request-target decoding,
+// path containment, content types, SSE framing, the reload hub and HTML
+// injection. Each case is a named function so `.try()` returns from it.
+Suite, Tester, TestError = std.test
+SseDecoder, SseEvent = std.net.sse
+relative_path, contains, TargetError = serve.paths
+content_type = serve.mime
+append_event, hub = serve.events
+inject_client = serve.client
+
+fail = (message: str) Res<(), TestError> { Err(TestError.Failed(message)) }
+
+expect_path = (t: Tester, target: str, want: str) Res<(), TestError> {
+    relative_path(t.alloc, target).match({
+        Ok(path) => (path.view() == want).match({ true => Ok(()), false => fail(target) }),
+        Err(_)   => fail(target),
+    })
+}
+
+expect_refused = (t: Tester, target: str) Res<(), TestError> {
+    relative_path(t.alloc, target).match({
+        Ok(_)  => fail(target),
+        Err(_) => Ok(()),
+    })
+}
+
+plain_targets_map_under_the_root = (t: Tester) Res<(), TestError> {
+    expect_path(t, "/", "").try();
+    expect_path(t, "/index.html", "index.html").try();
+    expect_path(t, "/app.js?v=3#top", "app.js").try();
+    expect_path(t, "/a/b/c.css", "a/b/c.css").try();
+    expect_path(t, "/docs/", "docs/").try();
+    expect_path(t, "/hello%20world.txt", "hello world.txt")
+}
+
+traversal_and_absolute_targets_are_refused = (t: Tester) Res<(), TestError> {
+    expect_refused(t, "/../etc/passwd").try();
+    expect_refused(t, "/a/../../etc/passwd").try();
+    expect_refused(t, "/%2e%2e/etc/passwd").try();
+    expect_refused(t, "/%2E%2E%2Fetc%2Fpasswd").try();
+    expect_refused(t, "/a%2f..%2f..%2fb").try();
+    expect_refused(t, "/..%5c..%5cwindows").try();
+    expect_refused(t, "/a\\b").try();
+    expect_refused(t, "//etc/passwd").try();
+    expect_refused(t, "/./app.js").try();
+    expect_refused(t, "/a%00.js").try();
+    expect_refused(t, "/bad%zz").try();
+    expect_refused(t, "/bad%2").try();
+    expect_refused(t, "http://example.com/app.js").try();
+    expect_refused(t, "etc/passwd").try();
+    expect_refused(t, "*")
+}
+
+containment_compares_whole_components = (t: Tester) Res<(), TestError> {
+    t.expect(contains("/srv/app", "/srv/app")).try();
+    t.expect(contains("/srv/app", "/srv/app/index.html")).try();
+    t.expect(!contains("/srv/app", "/srv/app-old/index.html")).try();
+    t.expect(!contains("/srv/app", "/etc/passwd")).try();
+    t.expect(!contains("", "/etc/passwd"))
+}
+
+content_types_follow_the_extension = (t: Tester) Res<(), TestError> {
+    t.expect(content_type("index.html") == "text/html; charset=utf-8").try();
+    t.expect(content_type("a/B.HTM") == "text/html; charset=utf-8").try();
+    t.expect(content_type("app.js") == "text/javascript; charset=utf-8").try();
+    t.expect(content_type("mod.mjs") == "text/javascript; charset=utf-8").try();
+    t.expect(content_type("style.css") == "text/css; charset=utf-8").try();
+    t.expect(content_type("app.wasm") == "application/wasm").try();
+    t.expect(content_type("app.js.map") == "application/json").try();
+    t.expect(content_type("logo.svg") == "image/svg+xml").try();
+    t.expect(content_type("x.png") == "image/png").try();
+    t.expect(content_type("x.jpeg") == "image/jpeg").try();
+    t.expect(content_type("dir.v2/README") == "application/octet-stream").try();
+    t.expect(content_type("archive.tar.gz") == "application/octet-stream")
+}
+
+sse_framing_round_trips = (t: Tester) Res<(), TestError> {
+    out ::= t.alloc.String().try(TestError.Failed("allocation failed"));
+    append_event(out, "build-error", "main.zen:3:1: error\r\n  here\n\nend").try(TestError.Failed("allocation failed"));
+    append_event(out, "reload", "7").try(TestError.Failed("allocation failed"));
+    t.expect(out.view() == "event: build-error\ndata: main.zen:3:1: error\ndata:   here\ndata: \ndata: end\n\nevent: reload\ndata: 7\n\n").try();
+    decoder ::= SseDecoder(t.alloc).try(TestError.Failed("allocation failed"));
+    events ::= t.alloc.Vec<SseEvent>();
+    decoder.feed(out.view(), t.alloc, events).try(TestError.Failed("allocation failed"));
+    t.expect(events.len == 2).try();
+    first = events.get(0).ok_or(TestError.Failed("first")).try();
+    first.match({
+        Message(m) => t.expect(m.kind == "build-error" && m.data == "main.zen:3:1: error\n  here\n\nend"),
+        Retry(_)   => fail("retry"),
+    }).try();
+    second = events.get(1).ok_or(TestError.Failed("second")).try();
+    second.match({
+        Message(m) => t.expect(m.kind == "reload" && m.data == "7"),
+        Retry(_)   => fail("retry"),
+    })
+}
+
+hub_replays_a_failed_build = (t: Tester) Res<(), TestError> {
+    state ::= hub(t.alloc).try(TestError.Failed("allocation failed"));
+    hello = state.greeting(t.alloc).try(TestError.Failed("allocation failed"));
+    t.expect(hello.view() == "event: hello\ndata: 1\n\n").try();
+    state.failed(t.alloc, "boom").try(TestError.Failed("allocation failed"));
+    again = state.greeting(t.alloc).try(TestError.Failed("allocation failed"));
+    t.expect(again.view() == "event: hello\ndata: 1\n\nevent: build-error\ndata: boom\n\n").try();
+    reload = state.succeeded(t.alloc).try(TestError.Failed("allocation failed"));
+    t.expect(reload.view() == "event: reload\ndata: 2\n\n").try();
+    after = state.greeting(t.alloc).try(TestError.Failed("allocation failed"));
+    t.expect(after.view() == "event: hello\ndata: 2\n\n")
+}
+
+client_script_lands_before_head_end = (t: Tester) Res<(), TestError> {
+    out ::= t.alloc.String().try(TestError.Failed("allocation failed"));
+    inject_client(out, "<html><HEAD><title>x</title></HEAD><body></body></html>").try(TestError.Failed("allocation failed"));
+    t.expect(out.view() == "<html><HEAD><title>x</title><script src=\"/__zen/client.js\"></script></HEAD><body></body></html>").try();
+    bare ::= t.alloc.String().try(TestError.Failed("allocation failed"));
+    inject_client(bare, "<p>hi</p>").try(TestError.Failed("allocation failed"));
+    t.expect(bare.view() == "<p>hi</p><script src=\"/__zen/client.js\"></script>")
+}
+
+main = (env: Env) Res<i32, IoError> {
+    suite ::= Suite(env: env);
+    suite.run("plain targets map under the root", (t) { plain_targets_map_under_the_root(t) }).try();
+    suite.run("traversal and absolute targets are refused", (t) { traversal_and_absolute_targets_are_refused(t) }).try();
+    suite.run("containment compares whole path components", (t) { containment_compares_whole_components(t) }).try();
+    suite.run("content types follow the extension", (t) { content_types_follow_the_extension(t) }).try();
+    suite.run("SSE framing round-trips through the std decoder", (t) { sse_framing_round_trips(t) }).try();
+    suite.run("the hub replays a failed build to new clients", (t) { hub_replays_a_failed_build(t) }).try();
+    suite.run("the client script lands before </head>", (t) { client_script_lands_before_head_end(t) }).try();
+    suite.finish()
+}

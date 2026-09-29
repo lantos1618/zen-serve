@@ -1,0 +1,7 @@
+// zen-serve for Linux: file watching through inotify.
+run, AppError = serve.app
+InotifyWatch = serve.watch_inotify
+
+main = (env: Env) Res<i32, AllocError | AppError> {
+    run(env, InotifyWatch())
+}

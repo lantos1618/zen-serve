@@ -1,0 +1,47 @@
+Builder, BuildError = std.build
+build = (b :: Builder) Res<(), BuildError> {
+    aead_nonce = b.lib("aead_nonce", {src: Path("../zen-crypto-integrated/src/aead_nonce.zen"), libs: [], paths: []}).try();
+    aes_gcm = b.lib("aes_gcm", {src: Path("../zen-crypto-integrated/src/aes_gcm.zen"), libs: [], paths: []}).try();
+    bits64 = b.lib("bits64", {src: Path("../zen-crypto-integrated/src/bits64.zen"), libs: [], paths: []}).try();
+    chacha20poly1305 = b.lib("chacha20poly1305", {src: Path("../zen-crypto-integrated/src/chacha20poly1305.zen"), libs: [], paths: []}).try();
+    der = b.lib("der", {src: Path("../zen-crypto-integrated/src/der.zen"), libs: [], paths: []}).try();
+    ec_key = b.lib("ec_key", {src: Path("../zen-crypto-integrated/src/ec_key.zen"), libs: [], paths: []}).try();
+    ecdsa = b.lib("ecdsa", {src: Path("../zen-crypto-integrated/src/ecdsa.zen"), libs: [], paths: []}).try();
+    ecdsa_p384 = b.lib("ecdsa_p384", {src: Path("../zen-crypto-integrated/src/ecdsa_p384.zen"), libs: [], paths: []}).try();
+    ff = b.lib("ff", {src: Path("../zen-crypto-integrated/src/ff.zen"), libs: [], paths: []}).try();
+    hkdf = b.lib("hkdf", {src: Path("../zen-crypto-integrated/src/hkdf.zen"), libs: [], paths: []}).try();
+    hkdf_sha2x64 = b.lib("hkdf_sha2x64", {src: Path("../zen-crypto-integrated/src/hkdf_sha2x64.zen"), libs: [], paths: []}).try();
+    hmac_sha256 = b.lib("hmac_sha256", {src: Path("../zen-crypto-integrated/src/hmac_sha256.zen"), libs: [], paths: []}).try();
+    hmac_sha2x64 = b.lib("hmac_sha2x64", {src: Path("../zen-crypto-integrated/src/hmac_sha2x64.zen"), libs: [], paths: []}).try();
+    hmac_sha512 = b.lib("hmac_sha512", {src: Path("../zen-crypto-integrated/src/hmac_sha512.zen"), libs: [], paths: []}).try();
+    p256 = b.lib("p256", {src: Path("../zen-crypto-integrated/src/p256.zen"), libs: [], paths: []}).try();
+    p256_fiat = b.lib("p256_fiat", {src: Path("../zen-crypto-integrated/src/p256_fiat.zen"), libs: [], paths: []}).try();
+    p256_scalar = b.lib("p256_scalar", {src: Path("../zen-crypto-integrated/src/p256_scalar.zen"), libs: [], paths: []}).try();
+    p384 = b.lib("p384", {src: Path("../zen-crypto-integrated/src/p384.zen"), libs: [], paths: []}).try();
+    p384_fiat = b.lib("p384_fiat", {src: Path("../zen-crypto-integrated/src/p384_fiat.zen"), libs: [], paths: []}).try();
+    p384_scalar = b.lib("p384_scalar", {src: Path("../zen-crypto-integrated/src/p384_scalar.zen"), libs: [], paths: []}).try();
+    pem = b.lib("pem", {src: Path("../zen-crypto-integrated/src/pem.zen"), libs: [], paths: []}).try();
+    rsa = b.lib("rsa", {src: Path("../zen-crypto-integrated/src/rsa.zen"), libs: [], paths: []}).try();
+    sha256 = b.lib("sha256", {src: Path("../zen-crypto-integrated/src/sha256.zen"), libs: [], paths: []}).try();
+    sha2x64 = b.lib("sha2x64", {src: Path("../zen-crypto-integrated/src/sha2x64.zen"), libs: [], paths: []}).try();
+    sha512 = b.lib("sha512", {src: Path("../zen-crypto-integrated/src/sha512.zen"), libs: [], paths: []}).try();
+    sodium_utils = b.lib("sodium_utils", {src: Path("../zen-crypto-integrated/src/sodium_utils.zen"), libs: [], paths: []}).try();
+    tls13 = b.lib("tls13", {src: Path("../zen-crypto-integrated/src/tls13.zen"), libs: [], paths: []}).try();
+    tls13_cert_client = b.lib("tls13_cert_client", {src: Path("../zen-crypto-integrated/src/tls13_cert_client.zen"), libs: [], paths: []}).try();
+    tls13_cert_config = b.lib("tls13_cert_config", {src: Path("../zen-crypto-integrated/src/tls13_cert_config.zen"), libs: [], paths: []}).try();
+    tls13_cert_server = b.lib("tls13_cert_server", {src: Path("../zen-crypto-integrated/src/tls13_cert_server.zen"), libs: [], paths: []}).try();
+    tls13_server = b.lib("tls13_server", {src: Path("../zen-crypto-integrated/src/tls13_server.zen"), libs: [], paths: []}).try();
+    tls13_session = b.lib("tls13_session", {src: Path("../zen-crypto-integrated/src/tls13_session.zen"), libs: [], paths: []}).try();
+    tls13_sha384 = b.lib("tls13_sha384", {src: Path("../zen-crypto-integrated/src/tls13_sha384.zen"), libs: [], paths: []}).try();
+    x25519 = b.lib("x25519", {src: Path("../zen-crypto-integrated/src/x25519.zen"), libs: [], paths: []}).try();
+    x509 = b.lib("x509", {src: Path("../zen-crypto-integrated/src/x509.zen"), libs: [], paths: []}).try();
+    x509_roots = b.lib("x509_roots", {src: Path("../zen-crypto-integrated/src/x509_roots.zen"), libs: [], paths: []}).try();
+    x509_verify = b.lib("x509_verify", {src: Path("../zen-crypto-integrated/src/x509_verify.zen"), libs: [], paths: []}).try();
+    workers = b.lib("workers", {src: Path("../zen-http-integrated/src/workers/worker.zen"), libs: [], paths: []}).try();
+    http = b.lib("http", {src: Path("../zen-http-integrated/src/http/http.zen"), libs: [], paths: []}).try();
+    serve = b.lib("serve", {src: Path("src/serve/serve.zen"), libs: [], paths: []}).try();
+    b.exe_test("unit", {src: Path("tests/unit.zen"), deps: [serve], out: Ok(Path("build/unit-tests"))}).try();
+    b.exe("zen-serve", {src: Path("src/main.zen"), deps: [serve, http, workers, aead_nonce, aes_gcm, bits64, chacha20poly1305, der, ec_key, ecdsa, ecdsa_p384, ff, hkdf, hkdf_sha2x64, hmac_sha256, hmac_sha2x64, hmac_sha512, p256, p256_fiat, p256_scalar, p384, p384_fiat, p384_scalar, pem, rsa, sha256, sha2x64, sha512, sodium_utils, tls13, tls13_cert_client, tls13_cert_config, tls13_cert_server, tls13_server, tls13_session, tls13_sha384, x25519, x509, x509_roots, x509_verify], out: Ok(Path("build/zen-serve"))}).try();
+    b.exe("zen-serve-linux", {src: Path("src/main_linux.zen"), deps: [serve, http, workers, aead_nonce, aes_gcm, bits64, chacha20poly1305, der, ec_key, ecdsa, ecdsa_p384, ff, hkdf, hkdf_sha2x64, hmac_sha256, hmac_sha2x64, hmac_sha512, p256, p256_fiat, p256_scalar, p384, p384_fiat, p384_scalar, pem, rsa, sha256, sha2x64, sha512, sodium_utils, tls13, tls13_cert_client, tls13_cert_config, tls13_cert_server, tls13_server, tls13_session, tls13_sha384, x25519, x509, x509_roots, x509_verify], out: Ok(Path("build/zen-serve-linux"))}).try();
+    Ok(())
+}

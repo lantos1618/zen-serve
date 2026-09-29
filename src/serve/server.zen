@@ -1,0 +1,177 @@
+// The Server actor: owns the listener, every connection and the readiness
+// engine that drives them, all on its own thread.
+//
+// It serves in bounded passes and yields to its mailbox between them, so
+// build notifications from the Builder are handled promptly even while the
+// engine would otherwise block in its readiness wait. A sender pairs each
+// message with one byte on the server's wake pipe (see `Wake`); the byte
+// makes the wait return, and `pending` counts bytes read minus messages
+// handled, so the actor knows a message is queued and must yield to it.
+Alloc, AllocError, Ptr, null_ptr, Pool, PoolAlloc, PoolPolicy = std.mem
+Clock = std.env
+TransportBackend = http.server_core
+Engine, open_engine, Admission, StartError = workers.worker
+DevShard = serve.dev_http
+
+Unix = c.bind("unistd.h", {
+    pipe = (fds: Ptr<i32>) i32
+    write = (fd: i32, bytes: Ptr<u8>, count: usize) i64
+    read = (fd: i32, bytes: Ptr<u8>, count: usize) i64
+    close = (fd: i32) i32
+})
+Descriptor = c.bind("fcntl.h", {
+    F_GETFL: i32
+    F_SETFL: i32
+    O_NONBLOCK: i32
+    fcntl = (fd: i32, command: i32, flags: i32) i32
+})
+
+// A nonblocking pipe: the server reads `reader`, message senders write one
+// byte to `writer` after each send. A full pipe already guarantees a wakeup,
+// so a failed write is harmless.
+Wake* = {
+    reader*: i32,
+    writer*: i32,
+
+    open* = (a: Alloc) Res<Wake, AllocError> {
+        fds = a.realloc<i32>(null_ptr<i32>(), 2).try();
+        (Unix.pipe(fds) == 0).ensure(AllocError.OutOfMemory).try();
+        Range(0, 2).loop((i) {
+            fd = fds.read(i);
+            flags = Descriptor.fcntl(fd, Descriptor.F_GETFL, 0);
+            Descriptor.fcntl(fd, Descriptor.F_SETFL, flags + Descriptor.O_NONBLOCK);
+        });
+        Ok(Wake(reader: fds.read(0), writer: fds.read(1)))
+    }
+
+    // `byte` is the caller's one-byte scratch buffer.
+    ring* = (self: @Self, byte: Ptr<u8>) {
+        byte.write(0, 1);
+        Unix.write(self.writer, byte, 1);
+    }
+}
+
+Server*<B: TransportBackend> = {
+    // Configuration copied at spawn; the live shard is inside `engine`.
+    shard: DevShard<B>,
+    wake: Wake,
+    // Startup outcome for the spawning thread: one byte, 1 = listening.
+    status: i32,
+    clock: Clock,
+    adapter :: PoolAlloc = PoolAlloc(pool: null_ptr<Pool>(), policy: PoolPolicy(cache_bytes: 0, block_bytes: 0, blocks: 0)),
+    engine :: Ptr<Engine<DevShard<B>>> = null_ptr<Engine<DevShard<B>>>(),
+    byte :: Ptr<u8> = null_ptr<u8>(),
+    pending :: i64 = 0,
+    queued :: usize = 0,
+    finished :: bool = false,
+
+    setup = (self :: @Self, ctx: Context) Res<(), StartError> {
+        cell = ctx.alloc.realloc<Pool>(null_ptr<Pool>(), 1).try(StartError.Allocation);
+        cell.write(0, Pool());
+        self.adapter = PoolAlloc(pool: cell, policy: PoolPolicy(cache_bytes: 16777216, block_bytes: 4194304, blocks: 64));
+        self.byte = ctx.alloc.raw(8, 8).try(StartError.Allocation);
+        slot = ctx.alloc.realloc<Engine<DevShard<B>>>(null_ptr<Engine<DevShard<B>>>(), 1).try(StartError.Allocation);
+        engine = open_engine(self.shard, self.adapter, self.adapter, self.clock, Admission.Own, self.wake.reader).try();
+        slot.write(0, engine);
+        self.engine = slot;
+        Ok(())
+    }
+
+    report = (self :: @Self, ok: bool) {
+        (!self.byte.is_null()).then(() {
+            self.byte.write(0, ok.match({true => 1, false => 0}));
+            Unix.write(self.status, self.byte, 1);
+        });
+    }
+
+    // Serve until a queued message needs this thread. When the engine goes
+    // idle with no message pending, one self-sent turn keeps serving while
+    // letting the mailbox (and a runtime stop) interleave.
+    serve = (self :: @Self, me: Ref<Server<B>>) {
+        loop((h) {
+            (self.finished || self.pending > 0).then(() { h.break(); });
+            engine ::= self.engine.take(0);
+            step = engine.pass(64, 1000);
+            self.engine.write(0, consume engine);
+            self.pending = self.pending + step.wakes;
+            step.outcome.match({
+                Done   => { self.finish(); h.break(); },
+                Failed => { self.finish(); h.break(); },
+                Idle   => {
+                    (self.pending <= 0 && self.queued > 0).then(() { h.break(); });
+                    (self.pending <= 0).then(() {
+                        me.turn(me).match({
+                            Ok(_)  => { self.queued = self.queued + 1; h.break(); },
+                            Err(_) => { self.finish(); h.break(); },
+                        });
+                    });
+                },
+                _      => (),
+            });
+        });
+    }
+
+    // Writes freshly queued events now instead of after the next wait.
+    flush = (self :: @Self) {
+        engine ::= self.engine.take(0);
+        engine.pass(1, 0);
+        self.engine.write(0, consume engine);
+    }
+
+    finish = (self :: @Self) {
+        (!self.finished).then(() {
+            self.finished = true;
+            (!self.engine.is_null()).then(() {
+                engine ::= self.engine.take(0);
+                engine.close();
+                self.engine.write(0, consume engine);
+            });
+        });
+    }
+
+    announce = (self :: @Self, ctx: Context, me: Ref<Server<B>>, event: Announcement, diagnostics: str) {
+        self.pending = self.pending - 1;
+        (!self.finished).then(() {
+            scratch = ctx.env.mem.alloc();
+            engine ::= self.engine.take(0);
+            reached = event.match({
+                Building => engine.shard.building(scratch),
+                Built    => engine.shard.built(scratch),
+                Failed   => engine.shard.failed(scratch, diagnostics),
+            }).match({ Ok(n) => n, Err(_) => 0 });
+            self.engine.write(0, consume engine);
+            self.flush();
+            event.match({
+                Building => (),
+                Built    => { ctx.env.out.println("zen-serve: reload sent to {} browser tab(s)", reached).ignore(); ctx.env.out.flush().ignore(); },
+                Failed   => { ctx.env.out.println("zen-serve: build error sent to {} browser tab(s)", reached).ignore(); ctx.env.out.flush().ignore(); },
+            });
+            self.serve(me);
+        });
+    }
+}
+
+Announcement* = Building | Built | Failed
+
+Server.impl(Actor, {
+    begin = (self :: @Self, ctx: Context, me: Ref<Server<B>>) {
+        ok = self.setup(ctx).match({Ok(_) => true, Err(_) => false});
+        self.report(ok);
+        ok.match({true => self.serve(me), false => self.finish()});
+    }
+    turn = (self :: @Self, ctx: Context, me: Ref<Server<B>>) {
+        (self.queued > 0).then(() { self.queued = self.queued - 1; });
+        self.serve(me);
+    }
+    // Each is sent by the Builder, which rings the wake pipe after sending.
+    building = (self :: @Self, ctx: Context, me: Ref<Server<B>>) {
+        self.announce(ctx, me, Announcement.Building, "");
+    }
+    built = (self :: @Self, ctx: Context, me: Ref<Server<B>>) {
+        self.announce(ctx, me, Announcement.Built, "");
+    }
+    failed = (self :: @Self, ctx: Context, me: Ref<Server<B>>, diagnostics: str) {
+        self.announce(ctx, me, Announcement.Failed, diagnostics);
+    }
+    stopped = (self :: @Self, ctx: Context) { self.finish(); }
+})

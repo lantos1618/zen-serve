@@ -1,0 +1,237 @@
+// `zen-serve <project-dir> <target> [options]`: command line, the initial
+// build, and the actor wiring.
+//
+//   Watcher --changed--> Builder --building/built/failed--> Server --SSE--> tabs
+//
+// The entry module (main.zen or main_linux.zen) picks the OS watch backend
+// and calls `run`.
+Alloc, AllocError, Ptr, null_ptr = std.mem
+str, String = std.text
+Vec = std.collections
+command, ValueType, Matches = std.cli
+TransportBackend = http.server_core
+PlainBackend = http.plain_transport
+cert_backend = http.native_cert_transport
+Tls13CertConfig, Tls13CertIdentity = tls13_cert_config
+Watch, Debounce = serve.watch
+canonical = serve.paths
+DevShard = serve.dev_http
+Server, Wake = serve.server
+Builder, run_build = serve.builder
+Watcher = serve.watcher
+
+Unix = c.bind("unistd.h", {
+    read = (fd: i32, bytes: Ptr<u8>, count: usize) i64
+    pipe = (fds: Ptr<i32>) i32
+})
+
+Id = Project | Target | Port | Host | Tls | Cert | Key | BuildCmd | Root | WatchPath | Quiet
+
+AppError* = Usage | Help | Startup
+
+Config* = {
+    project*: str,
+    target*: str,
+    host*: str,
+    port*: u16,
+    tls*: bool,
+    cert*: str,
+    key*: str,
+    build_cmd*: str,
+    // Newline-separated canonical paths.
+    roots*: str,
+    watch*: str,
+    quiet_ms*: u64,
+}
+
+values = (matches: Matches<Id>, name: str, a: Alloc) Res<Vec<str>, AllocError> {
+    out ::= a.Vec<str>();
+    matches.values.loop((m) { (m.name == name).then(() { out.add(m.raw).try(); }); });
+    Ok(out)
+}
+
+// Joins `paths` (relative to `project`, or absolute) as canonical
+// newline-separated paths; entries that do not exist are skipped with a note.
+resolve = (env: Env, a: Alloc, project: str, paths: Vec<str>) Res<str, AllocError> {
+    out ::= a.String().try();
+    paths.loop((path) {
+        joined ::= a.String().try();
+        path.starts_with("/").match({
+            true  => joined.add(path).try(),
+            false => { joined.add(project).try(); joined.add('/').try(); joined.add(path).try(); },
+        });
+        real = canonical(a, joined.view()).try();
+        (real.len == 0).match({
+            true  => env.out.println("zen-serve: skipping {} (does not exist yet)", joined.view()).ignore(),
+            false => {
+                (out.len() > 0).then(() { out.add('\n').try(); });
+                out.add(real).try();
+            },
+        });
+    });
+    Ok(out.view())
+}
+
+HELP_ROOTS: str = "Directory to serve, relative to the project; default build/web, then web if present"
+
+parse_config* = (env: Env, a: Alloc) Res<Config, AllocError | AppError> {
+    app ::= command<Id>(a, "zen-serve", "Build a Zen web app, serve it, and live-reload the browser on change");
+    app.positional("project", Id.Project, "PROJECT-DIR", ValueType.Text, "Project directory containing build.zen").try();
+    app.positional("target", Id.Target, "TARGET", ValueType.Text, "Build target to rebuild on change").try();
+    app.required("project");
+    app.required("target");
+    app.option("--port", Id.Port, "N", ValueType.U16, "Port to listen on").try();
+    app.default_value("--port", "8000");
+    app.option("--host", Id.Host, "ADDR", ValueType.Text, "IPv4 address to bind").try();
+    app.default_value("--host", "127.0.0.1");
+    app.flag("--tls", Id.Tls, "Serve HTTPS with native TLS 1.3 (needs --cert and --key)").try();
+    app.option("--cert", Id.Cert, "PEM", ValueType.Text, "Certificate chain, leaf first (relative to the current directory)").try();
+    app.default_value("--cert", "build/cert.pem");
+    app.option("--key", Id.Key, "PEM", ValueType.Text, "P-256 private key").try();
+    app.default_value("--key", "build/key.pem");
+    app.option("--build-cmd", Id.BuildCmd, "CMD", ValueType.Text, "Build command run by /bin/sh in the project (default: \"$ZEN\" build TARGET, with ZEN defaulting to zen)").try();
+    app.option("--root", Id.Root, "DIR", ValueType.Text, HELP_ROOTS).try();
+    app.repeatable("--root");
+    app.option("--watch", Id.WatchPath, "PATH", ValueType.Text, "File or directory to watch, relative to the project; default src and build.zen").try();
+    app.repeatable("--watch");
+    app.option("--debounce", Id.Quiet, "MS", ValueType.Usize, "Quiet period before a rebuild").try();
+    app.default_value("--debounce", "100");
+    matches = app.parse(env.argv, 1).try();
+    matches.error.match({
+        Ok(diagnostic) => diagnostic.kind.match({
+            HelpRequested => {
+                text = app.help().try();
+                env.out.println("{}", text.view()).ignore();
+                Err(AppError.Help)
+            },
+            _ => {
+                text = diagnostic.message(a).try();
+                env.out.println("zen-serve: {}", text.view()).ignore();
+                Err(AppError.Usage)
+            },
+        }),
+        None => Ok(()),
+    }).try();
+    project_arg = matches.last("project").ok_or(AppError.Usage).try().raw;
+    target      = matches.last("target").ok_or(AppError.Usage).try().raw;
+    project     = canonical(a, project_arg).try();
+    (project.len > 0).ensure(AppError.Usage).try();
+    port = matches.last("--port").ok_or(AppError.Usage).try().raw.parse_usize().ok_or(AppError.Usage).try();
+    (port > 0 && port < 65536).ensure(AppError.Usage).try();
+    build_cmd = matches.last("--build-cmd").match({
+        Ok(m) => m.raw,
+        None  => {
+            text = a.String("\"${{ZEN:-zen}}\" build {}", target).try();
+            text.view()
+        },
+    });
+    root_args ::= values(matches, "--root", a).try();
+    (root_args.len == 0).then(() { root_args.add("build/web").try(); root_args.add("web").try(); });
+    watch_args ::= values(matches, "--watch", a).try();
+    (watch_args.len == 0).then(() { watch_args.add("src").try(); watch_args.add("build.zen").try(); });
+    // A root that does not exist yet (before the first build) is served
+    // once it appears; keep its lexical path so the first build is visible.
+    roots ::= a.String().try();
+    root_args.loop((root) {
+        joined ::= a.String().try();
+        root.starts_with("/").match({
+            true  => joined.add(root).try(),
+            false => { joined.add(project).try(); joined.add('/').try(); joined.add(root).try(); },
+        });
+        real = canonical(a, joined.view()).try();
+        (roots.len() > 0).then(() { roots.add('\n').try(); });
+        roots.add((real.len > 0).match({true => real, false => joined.view()})).try();
+    });
+    Ok(Config(
+        project: project,
+        target: target,
+        host: matches.last("--host").ok_or(AppError.Usage).try().raw,
+        port: port.to_u64().to_u16().ok_or(AppError.Usage).try(),
+        tls: matches.present("--tls"),
+        cert: matches.last("--cert").ok_or(AppError.Usage).try().raw,
+        key: matches.last("--key").ok_or(AppError.Usage).try().raw,
+        build_cmd: build_cmd,
+        roots: roots.view(),
+        watch: resolve(env, a, project, watch_args).try(),
+        quiet_ms: matches.last("--debounce").ok_or(AppError.Usage).try().raw.parse_usize().ok_or(AppError.Usage).try().to_u64(),
+    ))
+}
+
+// Spawns the three actors for one transport and blocks until the server
+// actor stops (it serves until the process is interrupted).
+start = <W: Watch, B: TransportBackend>(env: Env, a: Alloc, config: Config, watch: W, backend: B, initial_ok: bool, initial_diagnostics: str) Res<(), AllocError | AppError> {
+    wake = Wake.open(a).try();
+    status = a.realloc<i32>(null_ptr<i32>(), 2).try();
+    (Unix.pipe(status) == 0).ensure(AppError.Startup).try();
+    shard = DevShard<B>(backend: backend, host: config.host, port: config.port, roots: config.roots, files: env.fs, mem: env.mem);
+    server = env.spawn(Server<B>(shard: shard, wake: wake, status: status.read(1), clock: env.clock)).match({
+        Ok(r)  => Ok(r),
+        Err(_) => Err(AppError.Startup),
+    }).try();
+    server.begin(server).ignore();
+    byte = a.raw(8, 8).try();
+    byte.write(0, 0);
+    Unix.read(status.read(0), byte, 1);
+    (byte.read(0) == 1).match({
+        false => {
+            env.out.println("zen-serve: cannot listen on {}:{}", config.host, config.port).ignore();
+            Err(AppError.Startup)
+        },
+        true  => {
+            scheme = config.tls.match({true => "https", false => "http"});
+            env.out.println("zen-serve: serving {}://{}:{}/", scheme, config.host, config.port).ignore();
+            env.out.flush().ignore();
+            (!initial_ok).then(() {
+                server.failed(server, initial_diagnostics).ignore();
+                wake.ring(byte);
+            });
+            builder = env.spawn(Builder<B>(project: config.project, command: config.build_cmd, server: server, wake: wake)).match({
+                Ok(r)  => Ok(r),
+                Err(_) => Err(AppError.Startup),
+            }).try();
+            watcher = env.spawn(Watcher<W, B>(backend: watch, roots: config.watch, builder: builder, debounce: Debounce(quiet_ms: config.quiet_ms))).match({
+                Ok(r)  => Ok(r),
+                Err(_) => Err(AppError.Startup),
+            }).try();
+            watcher.begin(watcher).ignore();
+            server.join();
+            Ok(())
+        },
+    })
+}
+
+USAGE: str = "usage: zen-serve <project-dir> <target> [--port N] [--host ADDR] [--tls --cert PEM --key PEM] [--build-cmd CMD] [--root DIR]... [--watch PATH]... [--debounce MS]"
+
+// Exit status: 0 after --help, 2 for a usage error; otherwise serves until
+// the process is interrupted.
+run* = <W: Watch>(env: Env, watch: W) Res<i32, AllocError | AppError> {
+    a = env.mem.alloc();
+    parse_config(env, a).match({
+        Ok(config) => { serve_project(env, a, config, watch).try(); Ok(0) },
+        Err(e)     => e.match({
+            OutOfMemory => Err(AllocError.OutOfMemory),
+            Help        => Ok(0),
+            Usage       => { env.out.println("{}", USAGE).ignore(); Ok(2) },
+            Startup     => Err(AppError.Startup),
+        }),
+    })
+}
+
+serve_project = <W: Watch>(env: Env, a: Alloc, config: Config, watch: W) Res<(), AllocError | AppError> {
+    env.out.println("zen-serve: {} target {}\nzen-serve: build command: {}", config.project, config.target, config.build_cmd).ignore();
+    env.out.flush().ignore();
+    first = run_build(env, a, config.project, config.build_cmd).try();
+    first.ok.match({
+        true  => env.out.println("zen-serve: initial build ok in {} ms", first.millis).ignore(),
+        false => env.out.println("zen-serve: initial build failed in {} ms\n{}", first.millis, first.diagnostics).ignore(),
+    });
+    config.tls.match({
+        false => start(env, a, config, watch, PlainBackend(), first.ok, first.diagnostics),
+        true  => {
+            chain = env.fs.read(a, config.cert).match({Ok(t) => Ok(t), Err(_) => Err(AppError.Startup)}).try();
+            key   = env.fs.read(a, config.key).match({Ok(t) => Ok(t), Err(_) => Err(AppError.Startup)}).try();
+            identity ::= Tls13CertConfig.load(a, chain.view(), key.view()).match({Ok(c) => Ok(consume c), Err(_) => Err(AppError.Startup)}).try();
+            start(env, a, config, watch, cert_backend(identity.identity()), first.ok, first.diagnostics)
+        },
+    })
+}

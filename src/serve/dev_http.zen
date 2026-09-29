@@ -1,0 +1,595 @@
+// The development HTTP/1.1 server: a zen-http worker shard that serves the
+// build output and holds the live-reload event streams.
+//
+// zen-http's own HTTP shard answers a synchronous Handler with a bounded
+// body and a fixed content type; a dev server needs per-file content types,
+// multi-megabyte bundles and responses that never end (Server-Sent Events).
+// This shard reuses the rest of zen-http unchanged: its transports (plain
+// TCP or native TLS 1.3 behind `TransportBackend`), its socket setup and the
+// readiness engine from `workers.worker`, and adds its own request handling.
+//
+// All state belongs to the one thread that runs the engine (the Server
+// actor). Slot buffers come from `fixed`; response bytes from `churn`, which
+// must free, because every response is a separate allocation.
+Alloc, AllocError, Ptr, null_ptr, Mem = std.mem
+str, String, str_at = std.text
+Readiness, Interest = std.net.readiness
+Clock = std.env
+TransportBackend = http.server_core
+Shard, Admission, StartError = workers.worker
+relative_path, canonical, contains, TargetError = serve.paths
+content_type, is_html = serve.mime
+Hub, hub = serve.events
+client_script, inject_client, CLIENT_PATH, EVENTS_PATH = serve.client
+
+Native = c.bind("string.h", {
+    memmove = (dst: Ptr<u8>, src: Ptr<u8>, len: usize) Ptr<u8>
+})
+Events = c.bind("poll.h", { POLLOUT: i32 })
+
+SLOTS*: usize = 64
+INPUT: usize = 16384
+// A subscriber that falls this far behind is disconnected rather than
+// buffered without bound.
+STREAM_BACKLOG: usize = 4194304
+IDLE_SECONDS: u64 = 30
+HEARTBEAT_SECONDS: u64 = 15
+
+Code = Success | BadRequest | Forbidden | NotFound | MethodNotAllowed
+
+status_line = (code: Code) str {
+    code.match({
+        Success          => "HTTP/1.1 200 OK\r\n",
+        BadRequest       => "HTTP/1.1 400 Bad Request\r\n",
+        Forbidden        => "HTTP/1.1 403 Forbidden\r\n",
+        NotFound         => "HTTP/1.1 404 Not Found\r\n",
+        MethodNotAllowed => "HTTP/1.1 405 Method Not Allowed\r\n",
+    })
+}
+
+// Every response: never cached (a rebuilt bundle must be fetched again) and
+// cross-origin isolated, which zen-ui's browser host needs for the
+// SharedArrayBuffer behind a Zen program's blocking standard input.
+COMMON_HEADERS: str = "Cache-Control: no-store\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Embedder-Policy: require-corp\r\nCross-Origin-Resource-Policy: same-origin\r\nX-Content-Type-Options: nosniff\r\n"
+STREAM_HEADERS: str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: keep-alive\r\nCross-Origin-Resource-Policy: same-origin\r\n\r\nretry: 1000\n\n"
+
+Conn = {
+    transport :: Ptr<()>,
+    input :: Ptr<u8>,
+    used :: usize,
+    // Queued response bytes (from churn): out[sent..len] remain to be written.
+    out :: Ptr<u8>,
+    len :: usize,
+    sent :: usize,
+    capacity :: usize,
+    // An event-stream subscriber: its response never ends and publish
+    // appends events to its queue.
+    streaming :: bool,
+    closing :: bool,
+    // Set by broadcast when a subscriber cannot take more; the next drive
+    // closes it.
+    broken :: bool,
+    active :: u64,
+    runnable :: bool,
+}
+
+empty_conn = () Conn {
+    Conn(transport: null_ptr<()>(), input: null_ptr<u8>(), used: 0, out: null_ptr<u8>(), len: 0, sent: 0,
+         capacity: 0, streaming: false, closing: false, broken: false, active: 0, runnable: false)
+}
+
+// Bytes moved by a positive transport io result. A free function: the
+// generic shard body cannot name the i64 conversion directly.
+transferred = (n: i64) usize { n.to_usize().value_or(0) }
+
+interest_of = (want: i32) Interest {
+    (want == Events.POLLOUT).match({true => Interest.Write, false => Interest.Read})
+}
+
+// Parsed request head. Views borrow the connection's input buffer.
+Head = { method: str, target: str, size: usize, close: bool, body: bool }
+
+// Progress of the request head in a connection's input buffer.
+Parsed = Partial | Complete(Head) | Invalid(Code)
+
+// Parses a complete request head (through the blank line). Malformed heads,
+// and heads that do not fit the input buffer, are refused with BadRequest.
+parse_head = (bytes: str) Parsed {
+    head_of(bytes).match({
+        Ok(parsed) => parsed,
+        Err(code)  => Parsed.Invalid(code),
+    })
+}
+
+head_of = (bytes: str) Res<Parsed, Code> {
+    end = bytes.find("\r\n\r\n").match({ Ok(n) => n + 4, None => 0 });
+    (end == 0).match({
+        true  => {
+            (bytes.len < INPUT).ensure(Code.BadRequest).try();
+            Ok(Parsed.Partial)
+        },
+        false => {
+            head  = bytes.slice(0, end - 4);
+            first = head.find("\r\n").value_or(head.len);
+            line  = head.slice(0, first);
+            method = line.split_once(' ').ok_or(Code.BadRequest).try();
+            target = method.after.split_once(' ').ok_or(Code.BadRequest).try();
+            (method.before.len > 0 && target.before.len > 0).ensure(Code.BadRequest).try();
+            (target.after == "HTTP/1.1" || target.after == "HTTP/1.0").ensure(Code.BadRequest).try();
+            close ::= target.after == "HTTP/1.0";
+            body  ::= false;
+            (first < head.len).then(() {
+                head.slice(first + 2, head.len).split('\n').loop((raw) {
+                    field = raw.split_once(':').ok_or(Code.BadRequest).try();
+                    value = field.after.trim().value_or("");
+                    field.before.eq_ignore_case("connection").then(() {
+                        value.eq_ignore_case("close").then(() { close = true; });
+                    });
+                    (field.before.eq_ignore_case("content-length") && value != "0").then(() { body = true; });
+                    field.before.eq_ignore_case("transfer-encoding").then(() { body = true; });
+                });
+            });
+            Ok(Parsed.Complete(Head(method: method.before, target: target.before, size: end, close: close, body: body)))
+        },
+    })
+}
+
+DevShard*<B: TransportBackend> = {
+    backend :: B,
+    host: str,
+    port: u16,
+    // Canonical served roots, newline-separated, searched in order.
+    roots: str,
+    files: Fs,
+    mem: Mem,
+    hub :: Ptr<Hub> = null_ptr<Hub>(),
+    listener :: Ptr<()> = null_ptr<()>(),
+    conns :: Ptr<Conn> = null_ptr<Conn>(),
+    churn :: Ptr<Alloc> = null_ptr<Alloc>(),
+    open :: usize = 0,
+    ready :: Ptr<usize> = null_ptr<usize>(),
+    batch :: Ptr<usize> = null_ptr<usize>(),
+    queued :: usize = 0,
+    now :: u64 = 0,
+    beat :: u64 = 0,
+    draining :: bool = false,
+
+    alloc = (self: @Self) Alloc { self.churn.read(0) }
+
+    mark = (self :: @Self, slot: usize, c :: Conn) {
+        (!c.runnable && self.queued < 2 * SLOTS).then(() {
+            c.runnable = true;
+            self.ready.write(self.queued, slot);
+            self.queued = self.queued + 1;
+        });
+    }
+
+    release = (self :: @Self, c :: Conn) {
+        self.backend.close(c.transport);
+        c.transport = null_ptr<()>();
+        (!c.out.is_null()).then(() { self.alloc().free(c.out); });
+        c.out = null_ptr<u8>(); c.len = 0; c.sent = 0; c.capacity = 0;
+        c.streaming = false; c.broken = false; c.runnable = false; c.used = 0;
+        self.open = self.open - 1;
+    }
+
+    // Appends to the connection's queue, compacting written bytes first.
+    // False when memory ran out or a subscriber fell too far behind.
+    enqueue = (self :: @Self, c :: Conn, bytes: str) bool {
+        (c.sent == c.len).then(() { c.sent = 0; c.len = 0; });
+        pending = c.len - c.sent;
+        ok ::= !(c.streaming && pending + bytes.len > STREAM_BACKLOG);
+        (ok && c.len + bytes.len > c.capacity).then(() {
+            want ::= c.capacity * 2;
+            (want < pending + bytes.len).then(() { want = pending + bytes.len; });
+            (want < 4096).then(() { want = 4096; });
+            self.alloc().raw(want, 16).match({
+                Err(_)    => { ok = false; },
+                Ok(fresh) => {
+                    (pending > 0).then(() { fresh.copy_from(c.out.offset(c.sent), pending); });
+                    (!c.out.is_null()).then(() { self.alloc().free(c.out); });
+                    c.out = fresh; c.capacity = want; c.sent = 0; c.len = pending;
+                },
+            });
+        });
+        ok.then(() {
+            (bytes.len > 0).then(() { c.out.offset(c.len).copy_from(bytes.ptr(), bytes.len); });
+            c.len = c.len + bytes.len;
+        });
+        ok
+    }
+
+    // A complete short response with the common headers.
+    simple = (self :: @Self, c :: Conn, a: Alloc, code: Code, kind: str, body: str, head_only: bool) Res<(), AllocError> {
+        out ::= a.String().try();
+        out.add(status_line(code)).try();
+        out.add("Content-Type: ").try();
+        out.add(kind).try();
+        out.add("\r\nContent-Length: ").try();
+        out.write_usize(body.len).try();
+        out.add("\r\n").try();
+        out.add(COMMON_HEADERS).try();
+        c.closing.then(() { out.add("Connection: close\r\n").try(); });
+        out.add("\r\n").try();
+        (!head_only).then(() { out.add(body).try(); });
+        self.enqueue(c, out.view()).ensure(AllocError.OutOfMemory)
+    }
+
+    // Finds the file for a root-relative path in the first root that has
+    // it. Refuses a path whose canonical form escapes its root (a symlink
+    // pointing outside). Directories resolve to their index.html.
+    locate = (self: @Self, a: Alloc, path: str) Res<str, AllocError | Code> {
+        found: Res<str> = loop((h) {
+            self.roots.split('\n').loop((root) {
+                (root.len > 0).then(() {
+                    joined ::= a.String().try();
+                    joined.add(root).try();
+                    joined.add('/').try();
+                    joined.add(path).try();
+                    (path.is_empty() || path.ends_with("/")).then(() { joined.add("index.html").try(); });
+                    (self.files.is_dir(joined.view())).then(() { joined.add("/index.html").try(); });
+                    real = canonical(a, joined.view()).try();
+                    (real.len > 0).then(() {
+                        contains(root, real).ensure(Code.Forbidden).try();
+                        (!self.files.is_dir(real)).then(() { h.break(real); });
+                    });
+                });
+            });
+            h.break();
+        });
+        found.ok_or(Code.NotFound)
+    }
+
+    // The file a GET for `target` reads, or the refusal code.
+    choose = (self: @Self, a: Alloc, target: str) Res<str, AllocError | Code> {
+        path = relative_path(a, target).match({
+            Ok(p)  => Ok(p),
+            Err(e) => e.match({
+                OutOfMemory => Err(AllocError.OutOfMemory),
+                Malformed   => Err(Code.BadRequest),
+                Traversal   => Err(Code.Forbidden),
+            }),
+        }).try();
+        self.locate(a, path.view())
+    }
+
+    refuse = (self :: @Self, c :: Conn, a: Alloc, code: Code, head_only: bool) Res<(), AllocError> {
+        text = code.match({
+            Success          => "ok\n",
+            BadRequest       => "bad request\n",
+            Forbidden        => "forbidden\n",
+            NotFound         => "not found\n",
+            MethodNotAllowed => "method not allowed\n",
+        });
+        self.simple(c, a, code, "text/plain; charset=utf-8", text, head_only)
+    }
+
+    serve_file = (self :: @Self, c :: Conn, a: Alloc, target: str, head_only: bool) Res<(), AllocError> {
+        self.choose(a, target).match({
+            Err(e)   => e.match({
+                OutOfMemory => Err(AllocError.OutOfMemory),
+                Success     => self.refuse(c, a, Code.NotFound, head_only),
+                BadRequest  => self.refuse(c, a, Code.BadRequest, head_only),
+                Forbidden   => self.refuse(c, a, Code.Forbidden, head_only),
+                NotFound    => self.refuse(c, a, Code.NotFound, head_only),
+                MethodNotAllowed => self.refuse(c, a, Code.MethodNotAllowed, head_only),
+            }),
+            Ok(file) => self.files.read(a, file).match({
+                Err(_)    => self.refuse(c, a, Code.NotFound, head_only),
+                Ok(bytes) => is_html(file).match({
+                    true  => {
+                        page ::= a.String().try();
+                        inject_client(page, bytes.view()).try();
+                        self.simple(c, a, Code.Success, content_type(file), page.view(), head_only)
+                    },
+                    false => self.simple(c, a, Code.Success, content_type(file), bytes.view(), head_only),
+                }),
+            }),
+        })
+    }
+
+    subscribe = (self :: @Self, c :: Conn, a: Alloc) Res<(), AllocError> {
+        c.streaming = true;
+        greeting = self.hub.read(0).greeting(a).try();
+        (self.enqueue(c, STREAM_HEADERS) && self.enqueue(c, greeting.view())).ensure(AllocError.OutOfMemory)
+    }
+
+    // Answers one complete request. The scratch arena lives for this call.
+    respond = (self :: @Self, c :: Conn, head: Head) Res<(), AllocError> {
+        scratch = self.mem.alloc();
+        c.closing = c.closing || head.close || head.body;
+        head_only = head.method == "HEAD";
+        loop((h) {
+            head.body.then(() {
+                self.simple(c, scratch, Code.BadRequest, "text/plain; charset=utf-8", "request bodies are not accepted\n", false).try();
+                h.break();
+            });
+            (head.method != "GET" && !head_only).then(() {
+                self.simple(c, scratch, Code.MethodNotAllowed, "text/plain; charset=utf-8", "method not allowed\n", false).try();
+                h.break();
+            });
+            (head.target == EVENTS_PATH).then(() { self.subscribe(c, scratch).try(); h.break(); });
+            (head.target == CLIENT_PATH).then(() {
+                script ::= scratch.String().try();
+                client_script(script).try();
+                self.simple(c, scratch, Code.Success, "text/javascript; charset=utf-8", script.view(), head_only).try();
+                h.break();
+            });
+            self.serve_file(c, scratch, head.target, head_only).try();
+            h.break();
+        });
+        Ok(())
+    }
+
+    // Reads, answers and writes until the transport would block. Returns
+    // true when the connection should be visited again without new readiness.
+    drive = (self :: @Self, c :: Conn) Res<bool, AllocError | Code> {
+        again ::= false;
+        steps ::= 0;
+        c.broken.then(() { Err(Code.BadRequest).try(); });
+        loop((h) {
+            steps = steps + 1;
+            (steps > 64).then(() { again = true; h.break(); });
+            (c.sent < c.len).match({
+                true  => {
+                    n = self.backend.io(c.transport, c.out.offset(c.sent), c.len - c.sent, 1);
+                    (n == -3).then(() { again = true; h.break(); });
+                    (n == -2).then(() { h.break(); });
+                    (n > 0).ensure(Code.BadRequest).try();
+                    c.sent = c.sent + transferred(n);
+                    c.active = self.now;
+                },
+                false => {
+                    // Everything queued is written.
+                    c.closing.then(() {
+                        done = self.backend.finish(c.transport);
+                        (done == -3).then(() { again = true; h.break(); });
+                        (done == -2).then(() { h.break(); });
+                        Err(Code.BadRequest).try();
+                    });
+                    parsed ::= Parsed.Partial;
+                    (!c.streaming && c.used > 0).then(() {
+                        parsed = parse_head(str_at(c.input, c.used));
+                    });
+                    parsed.match({
+                        Invalid(code) => {
+                            c.closing = true;
+                            scratch = self.mem.alloc();
+                            self.refuse(c, scratch, code, false).try();
+                        },
+                        Complete(head) => {
+                            self.respond(c, head).try();
+                            c.used = c.used - head.size;
+                            Native.memmove(c.input, c.input.offset(head.size), c.used);
+                        },
+                        Partial => {
+                            // Subscribers send nothing after their request;
+                            // reading still reports when the browser leaves.
+                            c.streaming.then(() { c.used = 0; });
+                            n = self.backend.io(c.transport, c.input.offset(c.used), INPUT - c.used, 0);
+                            (n == -3).then(() { again = true; h.break(); });
+                            (n == -2).then(() { h.break(); });
+                            (n > 0).ensure(Code.BadRequest).try();
+                            c.used = c.used + transferred(n);
+                            c.active = self.now;
+                        },
+                    });
+                },
+            });
+        });
+        Ok(again)
+    }
+
+    // Queues `event` on every subscriber and marks them runnable; the next
+    // engine pass writes them, and closes subscribers that cannot keep up.
+    // Returns how many subscribers the event reached.
+    broadcast* = (self :: @Self, event: str) usize {
+        reached ::= 0;
+        Range(0, SLOTS).loop((i) {
+            c ::= self.conns.read(i);
+            (!c.transport.is_null() && c.streaming).then(() {
+                self.enqueue(c, event).match({
+                    true  => { reached = reached + 1; self.mark(i, c); },
+                    false => { c.broken = true; self.mark(i, c); },
+                });
+                self.conns.write(i, c);
+            });
+        });
+        reached
+    }
+
+    // Build lifecycle, called by the Server actor between engine passes.
+    // Each updates what new subscribers are told and returns how many
+    // current subscribers the event reached.
+    building* = (self :: @Self, a: Alloc) Res<usize, AllocError> {
+        state ::= self.hub.read(0);
+        frame = state.started(a).try();
+        self.hub.write(0, state);
+        Ok(self.broadcast(frame.view()))
+    }
+
+    built* = (self :: @Self, a: Alloc) Res<usize, AllocError> {
+        state ::= self.hub.read(0);
+        frame = state.succeeded(a).try();
+        self.hub.write(0, state);
+        Ok(self.broadcast(frame.view()))
+    }
+
+    failed* = (self :: @Self, a: Alloc, diagnostics: str) Res<usize, AllocError> {
+        state ::= self.hub.read(0);
+        frame = state.failed(a, diagnostics).try();
+        self.hub.write(0, state);
+        Ok(self.broadcast(frame.view()))
+    }
+
+    subscribers* = (self: @Self) usize {
+        count ::= 0;
+        Range(0, SLOTS).loop((i) {
+            c = self.conns.read(i);
+            (!c.transport.is_null() && c.streaming).then(() { count = count + 1; });
+        });
+        count
+    }
+
+    install = (self :: @Self, reactor :: Readiness, slot: usize, transport: Ptr<()>) {
+        c ::= self.conns.read(slot);
+        c.transport = transport;
+        c.used = 0; c.len = 0; c.sent = 0; c.streaming = false; c.closing = false; c.runnable = false;
+        c.active = self.now;
+        self.open = self.open + 1;
+        want = self.backend.requested(transport);
+        reactor.add(self.backend.fd(transport), slot, interest_of(want)).match({
+            Ok(_)  => self.backend.mark_armed(transport, want),
+            Err(_) => self.release(c),
+        });
+        // A TLS handshake may already have bytes to send.
+        self.mark(slot, c);
+        self.conns.write(slot, c);
+    }
+
+    accept_all = (self :: @Self, reactor :: Readiness) {
+        Range(0, SLOTS).loop((h, i) {
+            c = self.conns.read(i);
+            c.transport.is_null().then(() {
+                transport: Ptr<()> = self.backend.accept(self.listener);
+                transport.is_null().then(() { h.break(); });
+                self.install(reactor, i, transport);
+            });
+        });
+    }
+}
+
+DevShard.impl(Shard, {
+    slots = (self: @Self) usize { SLOTS + 1 }
+
+    start = (self :: @Self, fixed: Alloc, churn: Alloc, reactor :: Readiness, admission: Admission, clock: Clock) Res<(), StartError> {
+        cell = fixed.realloc<Alloc>(null_ptr<Alloc>(), 1).try(StartError.Allocation);
+        cell.write(0, churn);
+        self.churn = cell;
+        self.now = clock.since_start().seconds_of();
+        self.beat = self.now;
+        conns = fixed.realloc<Conn>(null_ptr<Conn>(), SLOTS).try(StartError.Allocation);
+        Range(0, SLOTS).loop((i) { conns.write(i, empty_conn()); });
+        self.conns = conns;
+        state = fixed.realloc<Hub>(null_ptr<Hub>(), 1).try(StartError.Allocation);
+        state.write(0, hub(fixed).try(StartError.Allocation));
+        self.hub = state;
+        Range(0, SLOTS).loop((i) {
+            c ::= conns.read(i);
+            c.input = fixed.realloc<u8>(null_ptr<u8>(), INPUT).try(StartError.Allocation);
+            conns.write(i, c);
+        });
+        self.ready = fixed.realloc<usize>(null_ptr<usize>(), 2 * SLOTS).try(StartError.Allocation);
+        self.batch = fixed.realloc<usize>(null_ptr<usize>(), 2 * SLOTS).try(StartError.Allocation);
+        host = self.host.c_text(fixed).try(StartError.Allocation);
+        self.listener = self.backend.listen(churn, host.ptr(), self.port);
+        (!self.listener.is_null()).ensure(StartError.Listen).try();
+        reactor.add(self.backend.listener_fd(self.listener), SLOTS, Interest.Read).try(StartError.Poll);
+        Ok(())
+    }
+
+    listen = (self :: @Self, a: Alloc) i32 { -1 }
+
+    event = (self :: @Self, reactor :: Readiness, slot: usize) {
+        (slot == SLOTS).match({
+            true  => self.accept_all(reactor),
+            false => (slot < SLOTS).then(() {
+                c ::= self.conns.read(slot);
+                (!c.transport.is_null()).then(() { self.mark(slot, c); self.conns.write(slot, c); });
+            }),
+        });
+    }
+
+    run = (self :: @Self, reactor :: Readiness, clock: Clock) bool {
+        self.now = clock.since_start().seconds_of();
+        count = self.queued;
+        (count > 0).then(() { self.batch.copy_from(self.ready, count); });
+        self.queued = 0;
+        Range(0, count).loop((k) {
+            slot = self.batch.read(k);
+            c ::= self.conns.read(slot);
+            (!c.transport.is_null() && c.runnable).then(() {
+                c.runnable = false;
+                again ::= false;
+                failed ::= false;
+                self.drive(c).match({ Ok(more) => { again = more; }, Err(_) => { failed = true; } });
+                failed.then(() {
+                    reactor.remove(self.backend.fd(c.transport)).ignore();
+                    self.release(c);
+                });
+                (!c.transport.is_null()).then(() {
+                    want: i32 = self.backend.requested(c.transport);
+                    current: i32 = self.backend.armed(c.transport);
+                    (want != current).then(() {
+                        reactor.modify(self.backend.fd(c.transport), slot, interest_of(want)).match({
+                            Ok(_)  => self.backend.mark_armed(c.transport, want),
+                            Err(_) => self.release(c),
+                        });
+                    });
+                    (!c.transport.is_null() && again).then(() { self.mark(slot, c); });
+                });
+                self.conns.write(slot, c);
+            });
+        });
+        self.queued > 0
+    }
+
+    adopt = (self :: @Self, churn: Alloc, reactor :: Readiness, fd: i32) { }
+
+    tick = (self :: @Self, reactor :: Readiness, now: u64) {
+        self.now = now;
+        heartbeat = now >= self.beat + HEARTBEAT_SECONDS;
+        heartbeat.then(() { self.beat = now; });
+        Range(0, SLOTS).loop((i) {
+            c ::= self.conns.read(i);
+            (!c.transport.is_null()).then(() {
+                c.streaming.match({
+                    true  => heartbeat.then(() {
+                        self.enqueue(c, ": ping\n\n").then(() { self.mark(i, c); });
+                    }),
+                    false => (now >= c.active + IDLE_SECONDS).then(() {
+                        reactor.remove(self.backend.fd(c.transport)).ignore();
+                        self.release(c);
+                    }),
+                });
+                self.conns.write(i, c);
+            });
+        });
+    }
+
+    drain = (self :: @Self, reactor :: Readiness) {
+        self.draining = true;
+        (!self.listener.is_null()).then(() {
+            reactor.remove(self.backend.listener_fd(self.listener)).ignore();
+            self.backend.listener_close(self.listener);
+            self.listener = null_ptr<()>();
+        });
+        Range(0, SLOTS).loop((i) {
+            c ::= self.conns.read(i);
+            (!c.transport.is_null()).then(() {
+                reactor.remove(self.backend.fd(c.transport)).ignore();
+                self.release(c);
+                self.conns.write(i, c);
+            });
+        });
+    }
+
+    active = (self: @Self) usize { self.open }
+
+    close = (self :: @Self, fixed: Alloc, reactor :: Readiness) {
+        (!self.conns.is_null()).then(() {
+            Range(0, SLOTS).loop((i) {
+                c ::= self.conns.read(i);
+                (!c.transport.is_null()).then(() { self.release(c); });
+                fixed.free(c.input);
+                self.conns.write(i, c);
+            });
+            fixed.free(self.conns);
+            self.conns = null_ptr<Conn>();
+        });
+        (!self.listener.is_null()).then(() {
+            self.backend.listener_close(self.listener);
+            self.listener = null_ptr<()>();
+        });
+    }
+})

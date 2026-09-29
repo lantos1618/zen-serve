@@ -1,0 +1,64 @@
+// Counter in the browser: zen-ui's View, laid out by zen-ui, compiled by
+// Zen's JavaScript backend and drawn by the web host (`src/web_host.zen`,
+// also Zen). `zen build web-counter` writes build/web/ (index.html,
+// runtime.js, app.js); docs/WEB_DEMO.md in the compiler tree explains it.
+View, Error, Box, Text, Appearance, Color = ui
+Page, Event, screen = ui_web
+
+INCREMENT: u64 = 1
+DECREMENT: u64 = 2
+RESET: u64 = 3
+
+main = (env: Env) Res<i32, AllocError | Error> {
+    arena   = env.mem.alloc();
+    display = screen(390.0, 520.0);
+    os      = display.platform.match({Macos => "macOS", Ios => "iOS", Web => "Web"});
+    view ::= View.create(arena, 16, display.width, display.height).try();
+    panel = view.box(0, Box(id: "panel", height: 520.0, padding: 24.0, gap: 12.0, fill: true)).try();
+    view.set_appearance(panel, Appearance(background: Color(r: 0.09, g: 0.10, b: 0.13))).try();
+    title = view.text(panel, Text(id: "title", value: "ZEN UI", height: 46.0, size: 30.0)).try();
+    view.set_appearance(title, Appearance(foreground: Color(r: 0.55, g: 0.80, b: 1.0))).try();
+    details = arena.String("Running on {} · compiled by Zen's JS backend", os).try();
+    about = view.text(panel, Text(id: "platform", value: details.view(), height: 28.0, size: 15.0)).try();
+    view.set_appearance(about, Appearance(foreground: Color(r: 0.65, g: 0.67, b: 0.72))).try();
+    count = view.text(panel, Text(id: "count", value: "Count: 0", height: 64.0, size: 34.0)).try();
+    view.set_appearance(count, Appearance(alignment: 1)).try();
+    buttons = [
+        Text(id: "increment", value: "Increment", height: 48.0, size: 20.0),
+        Text(id: "decrement", value: "Decrement", height: 48.0, size: 20.0),
+        Text(id: "reset", value: "Reset", height: 48.0, size: 20.0),
+    ];
+    actions = [INCREMENT, DECREMENT, RESET];
+    Range(0, 3).loop((i) {
+        button = view.button(panel, buttons[i], actions[i]).try();
+        background = (i == 2).match({
+            true  => Color(r: 0.30, g: 0.32, b: 0.38),
+            false => Color(r: 0.20, g: 0.47, b: 0.95),
+        });
+        view.set_appearance(button, Appearance(background: background, radius: 10.0, alignment: 1)).try();
+    });
+    footer = view.text(panel, Text(id: "flow", value: "click → handler id → Zen loop → View → DOM", height: 40.0, size: 13.0)).try();
+    view.set_appearance(footer, Appearance(foreground: Color(r: 0.50, g: 0.52, b: 0.58), alignment: 1)).try();
+
+    page ::= Page.open(arena, view, "Zen UI · Web Counter").try();
+    value: i64 ::= 0;
+    running ::= true;
+    running.loop((h) {
+        page.next(view).match({
+            Closed        => { running = false; },
+            Press(action) => {
+                value = action.match({
+                    1 => value + 1,
+                    2 => value - 1,
+                    _ => 0,
+                });
+                // Formatting scratch lives for one event.
+                scratch = env.mem.alloc();
+                text = scratch.String("Count: {}", value).try();
+                view.set_text(count, text.view()).try();
+                page.sync(view);
+            },
+        });
+    });
+    Ok(0)
+}

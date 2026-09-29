@@ -1,0 +1,49 @@
+// Content types by file extension for the files a Zen web build produces
+// (HTML, JavaScript, WebAssembly, source maps) and common static assets.
+// Text types name their charset so a browser never guesses.
+str = std.text
+
+extension = (path: str) str {
+    name = path.after_last('/');
+    name.rfind('.').match({
+        Ok(dot) => name.slice(dot + 1, name.len),
+        None    => "",
+    })
+}
+
+content_type* = (path: str) str {
+    ext = extension(path);
+    (ext.eq_ignore_case("html") || ext.eq_ignore_case("htm")).match({
+        true  => "text/html; charset=utf-8",
+        false => (ext.eq_ignore_case("js") || ext.eq_ignore_case("mjs")).match({
+            true  => "text/javascript; charset=utf-8",
+            false => by_extension(ext),
+        }),
+    })
+}
+
+by_extension = (ext: str) str {
+    answer: Res<str> = loop((h) {
+        ext.eq_ignore_case("css").then(() { h.break("text/css; charset=utf-8"); });
+        ext.eq_ignore_case("json").then(() { h.break("application/json"); });
+        ext.eq_ignore_case("map").then(() { h.break("application/json"); });
+        ext.eq_ignore_case("wasm").then(() { h.break("application/wasm"); });
+        ext.eq_ignore_case("svg").then(() { h.break("image/svg+xml"); });
+        ext.eq_ignore_case("png").then(() { h.break("image/png"); });
+        (ext.eq_ignore_case("jpg") || ext.eq_ignore_case("jpeg")).then(() { h.break("image/jpeg"); });
+        ext.eq_ignore_case("gif").then(() { h.break("image/gif"); });
+        ext.eq_ignore_case("webp").then(() { h.break("image/webp"); });
+        ext.eq_ignore_case("ico").then(() { h.break("image/x-icon"); });
+        ext.eq_ignore_case("woff2").then(() { h.break("font/woff2"); });
+        ext.eq_ignore_case("woff").then(() { h.break("font/woff"); });
+        ext.eq_ignore_case("txt").then(() { h.break("text/plain; charset=utf-8"); });
+        ext.eq_ignore_case("zen").then(() { h.break("text/plain; charset=utf-8"); });
+        h.break();
+    });
+    answer.value_or("application/octet-stream")
+}
+
+is_html* = (path: str) bool {
+    ext = extension(path);
+    ext.eq_ignore_case("html") || ext.eq_ignore_case("htm")
+}

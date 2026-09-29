@@ -1,0 +1,109 @@
+// File-change notification, independent of the OS mechanism.
+//
+// A backend exposes one descriptor that becomes readable when something
+// under the armed roots changed, so the watcher can wait on it with a
+// timeout (poll) and never block past its debounce deadline. Backends do not
+// report which file changed: any change means "rebuild", and every change
+// re-arms the whole tree so files created since the last arm are covered.
+Alloc, AllocError = std.mem
+str = std.text
+walk, EntryKind = serve.tree
+
+WatchError* = Unavailable | Allocation
+
+Watch* = {
+    // Allocate the backend's lifetime buffers and its OS handle; false when
+    // either is unavailable.
+    open* = (self :: @Self, a: Alloc) bool
+    // Forget every registration before the tree is walked again.
+    reset* = (self :: @Self)
+    // Register one entry found by the walk. `path` is NUL-terminated
+    // (it comes from fts) and only borrowed for this call.
+    add* = (self :: @Self, path: str, kind: EntryKind, root: bool)
+    // Entries currently registered.
+    count* = (self: @Self) usize
+    // Readable while notifications are pending.
+    fd* = (self: @Self) i32
+    // Consume pending notifications; true when at least one arrived.
+    drain* = (self :: @Self) bool
+    close_all* = (self :: @Self)
+}
+
+// Registers every directory and file under the newline-separated roots.
+// Temporaries come from `scratch`; the backend keeps nothing from it.
+arm* = <W: Watch>(watch :: W, scratch: Alloc, roots: str) Res<usize, AllocError> {
+    watch.reset();
+    roots.split('\n').loop((root) {
+        (root.len > 0).then(() {
+            walk(scratch, root, (path, kind) { watch.add(path, kind, path == root); }).try();
+        });
+    });
+    Ok(watch.count())
+}
+
+// Collapses a burst of notifications (an editor's write, rename and chmod,
+// or a formatter touching many files) into one rebuild request, sent once
+// no change has arrived for `quiet_ms`.
+Debounce* = {
+    quiet_ms*: u64,
+    pending* :: bool = false,
+    last* :: u64 = 0,
+    changes* :: usize = 0,
+
+    touch* = (self :: @Self, now_ms: u64) {
+        self.pending = true;
+        self.last = now_ms;
+        self.changes = self.changes + 1;
+    }
+
+    due* = (self: @Self, now_ms: u64) bool {
+        self.pending && now_ms >= self.last + self.quiet_ms
+    }
+
+    // How long the watcher may block before the pending burst is due;
+    // `idle_ms` when nothing is pending.
+    wait_ms* = (self: @Self, now_ms: u64, idle_ms: i32) i32 {
+        self.pending.match({
+            false => idle_ms,
+            true  => (now_ms >= self.last + self.quiet_ms).match({
+                true  => 0,
+                false => (self.last + self.quiet_ms - now_ms).to_i32().value_or(idle_ms),
+            }),
+        })
+    }
+
+    // The number of notifications in the burst; clears it.
+    take* = (self :: @Self) usize {
+        count = self.changes;
+        self.pending = false;
+        self.changes = 0;
+        count
+    }
+}
+
+// Single-flight builds with coalescing. The builder actor runs a build
+// inside one message turn, so change requests that arrive meanwhile wait in
+// its mailbox. `changed` marks the tree dirty and asks for one self-sent run
+// message only when none is queued; `run` builds only if dirty. However many
+// changes land during a build, exactly one more build follows it.
+BuildQueue* = {
+    dirty* :: bool = false,
+    queued* :: bool = false,
+
+    // True when the caller must enqueue a run message.
+    changed* = (self :: @Self) bool {
+        self.dirty = true;
+        (!self.queued).match({
+            true  => { self.queued = true; true },
+            false => false,
+        })
+    }
+
+    // True when the caller must build now.
+    run* = (self :: @Self) bool {
+        self.queued = false;
+        build = self.dirty;
+        self.dirty = false;
+        build
+    }
+}

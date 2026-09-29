@@ -1,0 +1,9 @@
+// zen-serve for macOS and the BSDs: file watching through kqueue.
+// Linux builds src/main_linux.zen (inotify) instead; build.zen cannot yet
+// choose a module by target OS, so each backend has its own entry.
+run, AppError = serve.app
+KqueueWatch = serve.watch_kqueue
+
+main = (env: Env) Res<i32, AllocError | AppError> {
+    run(env, KqueueWatch())
+}

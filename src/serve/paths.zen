@@ -1,0 +1,114 @@
+// Request targets to files under a served root.
+//
+// Two independent checks keep every response inside a root:
+//   1. `relative_path` accepts only origin-form targets ("/a/b.js?x") and
+//      rejects any segment that could climb (".."), any encoded separator or
+//      NUL, and empty segments, so the joined path is lexically under the root.
+//   2. `contains` compares canonical (realpath) spellings, so a symlink inside
+//      the root that points outside it is refused even though its lexical
+//      path looked safe.
+Alloc, AllocError, Ptr, null_ptr = std.mem
+str, String, str_at = std.text
+
+Native = c.bind("stdlib.h", {
+    realpath = (path: Ptr<c_char>, resolved: Ptr<c_char>) Ptr<c_char>
+})
+Limits = c.bind("limits.h", { PATH_MAX: i32 = 4096 })
+Text = c.bind("string.h", { strlen = (text: Ptr<c_char>) usize })
+
+TargetError* = Malformed | Traversal
+
+hex_value = (ch: u8) Res<u8> {
+    (ch >= '0' && ch <= '9').match({
+        true  => Ok(ch - '0'),
+        false => (ch >= 'a' && ch <= 'f').match({
+            true  => Ok(ch - 'a' + 10),
+            false => (ch >= 'A' && ch <= 'F').match({
+                true  => Ok(ch - 'A' + 10),
+                false => None,
+            }),
+        }),
+    })
+}
+
+// Percent-decodes one segment into `out`. A decoded '/', '\', or NUL would
+// let a single segment name a different path, so they are refused.
+decode_segment = (segment: str, out :: String) Res<(), AllocError | TargetError> {
+    at ::= 0;
+    loop(at < segment.len, (h) {
+        ch = segment.index(at);
+        (ch == '%').match({
+            true  => {
+                (at + 2 < segment.len).ensure(TargetError.Malformed).try();
+                high = hex_value(segment.index(at + 1)).ok_or(TargetError.Malformed).try();
+                low  = hex_value(segment.index(at + 2)).ok_or(TargetError.Malformed).try();
+                byte = high * 16 + low;
+                (byte != '/' && byte != '\\' && byte != 0).ensure(TargetError.Traversal).try();
+                out.add(byte).try();
+                at = at + 3;
+            },
+            false => {
+                (ch != '\\').ensure(TargetError.Traversal).try();
+                out.add(ch).try();
+                at = at + 1;
+            },
+        });
+    });
+    Ok(())
+}
+
+// The root-relative path named by an origin-form request target, without a
+// leading slash: "/" gives "", "/app.js?v=2" gives "app.js". A trailing slash
+// is kept ("docs/") so the caller can serve that directory's index.
+relative_path* = (a: Alloc, target: str) Res<String, AllocError | TargetError> {
+    (target.starts_with("/")).ensure(TargetError.Malformed).try();
+    path_end = target.find('?').value_or(target.len);
+    fragment = target.find('#').value_or(target.len);
+    end      = (fragment < path_end).match({ true => fragment, false => path_end });
+    path     = target.slice(1, end);
+    out ::= a.String().try();
+    (path.is_empty()).match({
+        true  => Ok(out),
+        false => {
+            segment ::= a.String().try();
+            parts ::= 0;
+            total = path.count("/") + 1;
+            path.split('/').loop((raw) {
+                parts = parts + 1;
+                last = parts == total;
+                segment.clear();
+                decode_segment(raw, segment).try();
+                name = segment.view();
+                (name != "..").ensure(TargetError.Traversal).try();
+                // An empty or "." segment would make "//etc" or "/./x" name
+                // something other than what a reader of the URL expects.
+                (name.len > 0 || last).ensure(TargetError.Traversal).try();
+                (name != ".").ensure(TargetError.Traversal).try();
+                (out.len() > 0).then(() { out.add('/').try(); });
+                out.add(name).try();
+            });
+            Ok(out)
+        },
+    })
+}
+
+// Canonical absolute spelling of an existing path (symlinks resolved), or
+// None when the path does not exist. The result is owned by `a`.
+canonical* = (a: Alloc, path: str) Res<str, AllocError> {
+    name     = path.c_text(a).try();
+    capacity = Limits.PATH_MAX.to_i64().to_usize().value_or(4096) + 1;
+    buffer   = a.realloc<u8>(null_ptr<u8>(), capacity).try();
+    answer   = Native.realpath(name.ptr().to<c_char>(), buffer.to<c_char>());
+    answer.is_null().match({
+        true  => Ok(""),
+        false => Ok(str_at(buffer, Text.strlen(buffer.to<c_char>()))),
+    })
+}
+
+// True when canonical `path` is `root` itself or lies below it. Both must
+// already be canonical; "/srv/app-old" is not inside "/srv/app".
+contains* = (root: str, path: str) bool {
+    root.len > 0 && path.starts_with(root) && (path.len == root.len
+        || root.ends_with("/")
+        || path.index(root.len) == '/')
+}

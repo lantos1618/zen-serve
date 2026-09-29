@@ -1,0 +1,59 @@
+// Recursive listing of watch roots through fts(3), which both macOS and
+// glibc provide. Hidden entries (a name starting with '.') are skipped along
+// with everything below them: editor swap files and VCS metadata are not
+// build inputs.
+Alloc, AllocError, Ptr, null_ptr = std.mem
+str, str_at = std.text
+
+FtsEntry = c.record("fts.h", "FTSENT", {
+    fts_path: Ptr<c_char>,
+    fts_info: u16,
+})
+Fts = c.bind("fts.h", {
+    FTS_PHYSICAL: i32
+    FTS_NOCHDIR: i32
+    FTS_SKIP: i32
+    FTS_D: u32
+    FTS_F: u32
+    fts_open = (paths: Ptr<Ptr<c_char>>, options: i32, compare: Ptr<()>) Ptr<()>
+    fts_read = (tree: Ptr<()>) Ptr<FtsEntry>
+    fts_set = (tree: Ptr<()>, entry: Ptr<FtsEntry>, instruction: i32) i32
+    fts_close = (tree: Ptr<()>) i32
+})
+Text = c.bind("string.h", { strlen = (text: Ptr<c_char>) usize })
+
+EntryKind* = File | Directory
+
+// A hidden component below the walk root; the root itself may be anything.
+hidden = (path: str, root: str) bool {
+    path.len > root.len && path.after_last('/').starts_with(".")
+}
+
+// Calls `visit` once per directory (in preorder) and regular file under
+// `root`, which may itself be a file. Symlinks are reported as themselves,
+// not followed. A missing root visits nothing.
+walk* = (a: Alloc, root: str, visit: (path: str, kind: EntryKind) ()) Res<(), AllocError> {
+    name  = root.c_text(a).try();
+    paths = a.realloc<Ptr<c_char>>(null_ptr<Ptr<c_char>>(), 2).try();
+    paths.write(0, name.ptr().to<c_char>());
+    paths.write(1, null_ptr<c_char>());
+    tree = Fts.fts_open(paths, Fts.FTS_PHYSICAL + Fts.FTS_NOCHDIR, null_ptr<()>());
+    (!tree.is_null()).then(() {
+        loop((h) {
+            entry = Fts.fts_read(tree);
+            entry.is_null().then(() { h.break(); });
+            record = entry.read(0);
+            path   = str_at(record.fts_path.to<u8>(), Text.strlen(record.fts_path));
+            info   = record.fts_info.to_u32();
+            hidden(path, root).match({
+                true  => (info == Fts.FTS_D).then(() { Fts.fts_set(tree, entry, Fts.FTS_SKIP); }),
+                false => {
+                    (info == Fts.FTS_D).then(() { visit(path, EntryKind.Directory); });
+                    (info == Fts.FTS_F).then(() { visit(path, EntryKind.File); });
+                },
+            });
+        });
+        Fts.fts_close(tree);
+    });
+    Ok(())
+}

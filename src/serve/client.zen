@@ -1,0 +1,87 @@
+// The browser half of live reload, and its injection into served HTML.
+//
+// The client is the one piece of hand-written JavaScript in zen-serve. It
+// needs EventSource and the DOM, which the Zen JavaScript backend does not
+// reach: its browser host runs a program inside a Worker and speaks only
+// byte packets over the standard streams. When the backend gains a DOM
+// binding this script should become a Zen program built by that backend.
+AllocError = std.mem
+str, String = std.text
+
+CLIENT_PATH*: str = "/__zen/client.js"
+EVENTS_PATH*: str = "/__zen/events"
+SCRIPT_TAG: str = "<script src=\"/__zen/client.js\"></script>"
+
+// One line per statement keeps the source readable here and in devtools.
+CLIENT_LINES: [str, 30] = [
+    "// zen-serve live reload: EventSource on /__zen/events.",
+    "(function () {",
+    "  'use strict';",
+    "  var generation = null, overlay = null, badge = null;",
+    "  function clearBadge() { if (badge) { badge.remove(); badge = null; } }",
+    "  function showBadge(text) {",
+    "    if (!badge) { badge = document.createElement('div'); badge.id = 'zen-serve-badge';",
+    "      badge.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:2147483647;padding:6px 10px;border-radius:6px;background:#1f2430;color:#cfd6e4;font:12px ui-monospace,Menlo,monospace;opacity:.9';",
+    "      document.documentElement.appendChild(badge); }",
+    "    badge.textContent = text;",
+    "  }",
+    "  function showError(text) {",
+    "    clearBadge();",
+    "    if (!overlay) { overlay = document.createElement('div'); overlay.id = 'zen-serve-overlay';",
+    "      overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;overflow:auto;padding:24px;background:rgba(18,4,8,.94);color:#ffd7d7;font:13px/1.5 ui-monospace,Menlo,monospace';",
+    "      var title = document.createElement('div'); title.textContent = 'Zen build failed'; title.style.cssText = 'font-size:18px;font-weight:600;color:#ff8080;margin-bottom:12px';",
+    "      var body = document.createElement('pre'); body.style.cssText = 'white-space:pre-wrap;margin:0';",
+    "      overlay.appendChild(title); overlay.appendChild(body); document.documentElement.appendChild(overlay); }",
+    "    overlay.lastChild.textContent = text;",
+    "  }",
+    "  var source = new EventSource('/__zen/events');",
+    "  source.addEventListener('hello', function (e) {",
+    "    if (generation !== null && generation !== e.data) { location.reload(); return; }",
+    "    generation = e.data; clearBadge();",
+    "  });",
+    "  source.addEventListener('building', function () { if (!overlay) showBadge('rebuilding…'); });",
+    "  source.addEventListener('reload', function () { location.reload(); });",
+    "  source.addEventListener('build-error', function (e) { showError(e.data); });",
+    "  source.onerror = function () { if (!overlay) showBadge('zen-serve disconnected; retrying…'); };",
+    "})();",
+]
+
+client_script* = (out :: String) Res<(), AllocError> {
+    CLIENT_LINES.loop((line) {
+        out.add(line).try();
+        out.add('\n').try();
+    });
+    Ok(())
+}
+
+lower = (ch: u8) u8 {
+    (ch >= 'A' && ch <= 'Z').match({ true => ch + 32, false => ch })
+}
+
+// First offset of `needle` (lowercase ASCII) in `text`, ignoring case.
+find_ignore_case = (text: str, needle: str) Res<usize> {
+    (needle.len > 0 && needle.len <= text.len).ensure().try();
+    found: Res<usize> = loop((h) {
+        Range(0, text.len - needle.len + 1).loop((at) {
+            same ::= true;
+            Range(0, needle.len).loop((scan, k) {
+                (lower(text.index(at + k)) != needle.index(k)).then(() { same = false; scan.break(); });
+            });
+            same.then(() { h.break(at); });
+        });
+        h.break();
+    });
+    found
+}
+
+// Writes `html` with the client script tag before </head>, else before
+// </body>, else at the end: the page runs unchanged apart from one script.
+inject_client* = (out :: String, html: str) Res<(), AllocError> {
+    at = find_ignore_case(html, "</head>").match({
+        Ok(n) => n,
+        None  => find_ignore_case(html, "</body>").value_or(html.len),
+    });
+    out.add(html.slice(0, at)).try();
+    out.add(SCRIPT_TAG).try();
+    out.add(html.slice(at, html.len))
+}

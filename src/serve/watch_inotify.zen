@@ -1,0 +1,96 @@
+// Linux watch backend: one inotify instance with a watch on every directory
+// under the roots (and on a root that is a single file). A directory watch
+// reports writes to the files it contains, so regular files need no watch
+// of their own.
+Alloc, AllocError, Ptr, null_ptr = std.mem
+str = std.text
+Watch, WatchError = serve.watch
+EntryKind = serve.tree
+
+Inotify = c.bind("sys/inotify.h", {
+    IN_NONBLOCK: i32
+    IN_CLOEXEC: i32
+    IN_MODIFY: u32
+    IN_ATTRIB: u32
+    IN_CLOSE_WRITE: u32
+    IN_MOVED_FROM: u32
+    IN_MOVED_TO: u32
+    IN_CREATE: u32
+    IN_DELETE: u32
+    IN_DELETE_SELF: u32
+    IN_MOVE_SELF: u32
+    inotify_init1 = (flags: i32) i32
+    inotify_add_watch = (fd: i32, path: Ptr<c_char>, mask: u32) i32
+})
+Unix = c.bind("unistd.h", {
+    read = (fd: i32, bytes: Ptr<u8>, count: usize) i64
+    close = (fd: i32) i32
+})
+
+BUFFER: usize = 16384
+
+InotifyWatch* = {
+    queue :: i32 = -1,
+    watched :: usize = 0,
+    buffer :: Ptr<u8> = null_ptr<u8>(),
+
+    mask = (self: @Self) u32 {
+        Inotify.IN_MODIFY + Inotify.IN_ATTRIB + Inotify.IN_CLOSE_WRITE + Inotify.IN_MOVED_FROM
+            + Inotify.IN_MOVED_TO + Inotify.IN_CREATE + Inotify.IN_DELETE + Inotify.IN_DELETE_SELF + Inotify.IN_MOVE_SELF
+    }
+
+    watch_path = (self :: @Self, path: str) {
+        rc = Inotify.inotify_add_watch(self.queue, path.ptr().to<c_char>(), self.mask());
+        (rc >= 0).then(() { self.watched = self.watched + 1; });
+    }
+}
+
+InotifyWatch.impl(Watch, {
+    open = (self :: @Self, a: Alloc) bool {
+        a.realloc<u8>(null_ptr<u8>(), BUFFER).match({
+            Err(_)     => false,
+            Ok(buffer) => {
+                self.buffer = buffer;
+                self.queue  = Inotify.inotify_init1(Inotify.IN_NONBLOCK + Inotify.IN_CLOEXEC);
+                self.queue >= 0
+            },
+        })
+    }
+
+    // A fresh instance drops every old watch; the old descriptor is closed
+    // only after the new one exists, so `fd` stays valid for the watcher.
+    reset = (self :: @Self) {
+        fresh = Inotify.inotify_init1(Inotify.IN_NONBLOCK + Inotify.IN_CLOEXEC);
+        (fresh >= 0).then(() {
+            Unix.close(self.queue);
+            self.queue = fresh;
+        });
+        self.watched = 0;
+    }
+
+    // Directories cover the files inside them; a root that is a single file
+    // needs its own watch.
+    add = (self :: @Self, path: str, kind: EntryKind, root: bool) {
+        wanted = kind.match({ Directory => true, File => root });
+        wanted.match({ true => self.watch_path(path), false => () });
+    }
+
+    count = (self: @Self) usize { self.watched }
+
+    fd = (self: @Self) i32 { self.queue }
+
+    drain = (self :: @Self) bool {
+        seen ::= false;
+        loop((h) {
+            n = Unix.read(self.queue, self.buffer, BUFFER);
+            (n <= 0).then(() { h.break(); });
+            seen = true;
+        });
+        seen
+    }
+
+    close_all = (self :: @Self) {
+        (self.queue >= 0).then(() { Unix.close(self.queue); self.queue = -1; });
+        self.watched = 0;
+    }
+})

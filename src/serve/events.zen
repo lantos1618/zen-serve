@@ -1,0 +1,89 @@
+// Live-reload events and their Server-Sent Events wire form.
+//
+// The browser client (client.zen) understands four event names:
+//   hello        data: build generation; a changed generation after a
+//                reconnect means the page is stale and reloads
+//   building     a rebuild started (the client shows a small badge)
+//   reload       a rebuild succeeded; data is the new generation
+//   build-error  a rebuild failed; data is the compiler's diagnostics,
+//                shown as an overlay until the next successful build
+Alloc, AllocError = std.mem
+str, String = std.text
+
+HELLO*: str = "hello"
+BUILDING*: str = "building"
+RELOAD*: str = "reload"
+BUILD_ERROR*: str = "build-error"
+
+// Appends one event. Each line of `data` becomes its own `data:` field (a
+// bare "\n" inside a field would end it early), CR is dropped so CRLF text
+// from a tool keeps its lines, and the blank line dispatches the event.
+append_event* = (out :: String, kind: str, data: str) Res<(), AllocError> {
+    out.add("event: ").try();
+    out.add(kind).try();
+    out.add('\n').try();
+    data.split('\n').loop((line) {
+        out.add("data: ").try();
+        line.loop((ch) { (ch != '\r').then(() { out.add(ch).try(); }); });
+        out.add('\n').try();
+    });
+    out.add('\n')
+}
+
+// A comment line: ignored by EventSource, but it makes a dead connection
+// fail its next write so the server can reclaim the slot.
+append_heartbeat* = (out :: String) Res<(), AllocError> { out.add(": ping\n\n") }
+
+// The server's current answer for a newly connected client.
+BuildState* = Ready | Failed
+
+// Owns what a new subscriber must be told: the generation of the build it
+// is looking at and, while the latest build is broken, the diagnostics.
+Hub* = {
+    generation* :: u64,
+    state* :: BuildState,
+    diagnostics* :: String,
+
+    // Bytes a freshly connected client receives right after the headers.
+    greeting* = (self: @Self, a: Alloc) Res<String, AllocError> {
+        out ::= a.String().try();
+        number ::= a.String().try();
+        number.write_usize(self.generation.to_usize().value_or(0)).try();
+        append_event(out, HELLO, number.view()).try();
+        self.state.match({
+            Ready  => (),
+            Failed => append_event(out, BUILD_ERROR, self.diagnostics.view()).try(),
+        });
+        Ok(out)
+    }
+
+    started* = (self :: @Self, a: Alloc) Res<String, AllocError> {
+        out ::= a.String().try();
+        append_event(out, BUILDING, "").try();
+        Ok(out)
+    }
+
+    succeeded* = (self :: @Self, a: Alloc) Res<String, AllocError> {
+        self.generation = self.generation + 1;
+        self.state = BuildState.Ready;
+        self.diagnostics.clear();
+        out ::= a.String().try();
+        number ::= a.String().try();
+        number.write_usize(self.generation.to_usize().value_or(0)).try();
+        append_event(out, RELOAD, number.view()).try();
+        Ok(out)
+    }
+
+    failed* = (self :: @Self, a: Alloc, diagnostics: str) Res<String, AllocError> {
+        self.state = BuildState.Failed;
+        self.diagnostics.clear();
+        self.diagnostics.add(diagnostics).try();
+        out ::= a.String().try();
+        append_event(out, BUILD_ERROR, diagnostics).try();
+        Ok(out)
+    }
+}
+
+hub* = (a: Alloc) Res<Hub, AllocError> {
+    Ok(Hub(generation: 1, state: BuildState.Ready, diagnostics: a.String().try()))
+}

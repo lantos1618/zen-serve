@@ -1,0 +1,116 @@
+// macOS/BSD watch backend: one kqueue, one EVFILT_VNODE registration per
+// watched directory and file. A vnode event needs an open descriptor, so
+// the process descriptor limit bounds the watched set (MAX_WATCHES; raise
+// RLIMIT_NOFILE before arming a large tree). Directory events report entries
+// being added, removed or renamed; file events report writes in place.
+Alloc, AllocError, Ptr, null_ptr = std.mem
+str = std.text
+Watch, WatchError = serve.watch
+EntryKind = serve.tree
+
+Kevent = c.record("sys/event.h", "struct kevent", {
+    ident: usize,
+    filter: i16,
+    flags: u16,
+    fflags: u32,
+})
+Timespec = c.record("time.h", "struct timespec", {})
+Kq = c.bind("sys/event.h", {
+    EVFILT_VNODE: i16
+    EV_ADD: u16
+    EV_CLEAR: u16
+    NOTE_WRITE: u32
+    NOTE_DELETE: u32
+    NOTE_RENAME: u32
+    NOTE_EXTEND: u32
+    NOTE_ATTRIB: u32
+    NOTE_LINK: u32
+    kqueue = () i32
+    kevent = (kq: i32, changes: Ptr<Kevent>, count: i32, events: Ptr<Kevent>, capacity: i32, timeout: Ptr<Timespec>) i32
+})
+Files = c.bind("fcntl.h", {
+    O_EVTONLY: i32 = 32768
+    open = (path: Ptr<c_char>, flags: i32) i32
+})
+Unix = c.bind("unistd.h", { close = (fd: i32) i32 })
+
+MAX_WATCHES*: usize = 4096
+EVENTS: usize = 64
+
+KqueueWatch* = {
+    queue :: i32 = -1,
+    fds :: Ptr<i32> = null_ptr<i32>(),
+    watched :: usize = 0,
+    events :: Ptr<Kevent> = null_ptr<Kevent>(),
+    // A zero timeout, so draining never blocks.
+    zero :: Ptr<Timespec> = null_ptr<Timespec>(),
+
+    release = (self :: @Self) {
+        Range(0, self.watched).loop((i) { Unix.close(self.fds.read(i)); });
+        self.watched = 0;
+    }
+
+    watch_path = (self :: @Self, path: str) {
+        (self.watched < MAX_WATCHES).then(() {
+            fd = Files.open(path.ptr().to<c_char>(), Files.O_EVTONLY);
+            (fd >= 0).then(() {
+                change = Kevent(
+                    ident: fd.to_i64().to_usize().value_or(0),
+                    filter: Kq.EVFILT_VNODE,
+                    flags: Kq.EV_ADD + Kq.EV_CLEAR,
+                    fflags: Kq.NOTE_WRITE + Kq.NOTE_DELETE + Kq.NOTE_RENAME + Kq.NOTE_EXTEND + Kq.NOTE_ATTRIB + Kq.NOTE_LINK
+                );
+                self.events.write(0, change);
+                (Kq.kevent(self.queue, self.events, 1, null_ptr<Kevent>(), 0, self.zero) == 0).match({
+                    true  => { self.fds.write(self.watched, fd); self.watched = self.watched + 1; },
+                    false => { Unix.close(fd); },
+                });
+            });
+        });
+    }
+}
+
+KqueueWatch.impl(Watch, {
+    open = (self :: @Self, a: Alloc) bool {
+        buffers = a.realloc<i32>(null_ptr<i32>(), MAX_WATCHES).match({
+            Err(_) => false,
+            Ok(fds) => a.realloc<Kevent>(null_ptr<Kevent>(), EVENTS).match({
+                Err(_) => false,
+                Ok(events) => a.realloc<Timespec>(null_ptr<Timespec>(), 1).match({
+                    Err(_) => false,
+                    Ok(zero) => {
+                        zero.write(0, Timespec());
+                        self.fds = fds; self.events = events; self.zero = zero;
+                        true
+                    },
+                }),
+            }),
+        });
+        self.queue = buffers.match({ true => Kq.kqueue(), false => -1 });
+        self.queue >= 0
+    }
+
+    // Closing a descriptor removes its kevent registrations.
+    reset = (self :: @Self) { self.release(); }
+
+    add = (self :: @Self, path: str, kind: EntryKind, root: bool) { self.watch_path(path); }
+
+    count = (self: @Self) usize { self.watched }
+
+    fd = (self: @Self) i32 { self.queue }
+
+    drain = (self :: @Self) bool {
+        seen ::= false;
+        loop((h) {
+            n = Kq.kevent(self.queue, null_ptr<Kevent>(), 0, self.events, EVENTS.to_u64().to_i32().value_or(64), self.zero);
+            (n <= 0).then(() { h.break(); });
+            seen = true;
+        });
+        seen
+    }
+
+    close_all = (self :: @Self) {
+        self.release();
+        (self.queue >= 0).then(() { Unix.close(self.queue); self.queue = -1; });
+    }
+})

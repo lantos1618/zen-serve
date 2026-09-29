@@ -1,0 +1,67 @@
+// The Watcher actor: waits on the OS notification descriptor, debounces
+// bursts, and asks the Builder for one build per settled burst.
+//
+// Each turn blocks in poll(2) for at most the debounce deadline (or one
+// second when idle), then sends itself the next turn, so the actor never
+// holds its thread longer than that and a runtime stop is observed.
+Alloc, AllocError, Ptr, null_ptr = std.mem
+str = std.text
+TransportBackend = http.server_core
+Watch, Debounce, arm = serve.watch
+Builder = serve.builder
+
+PollFd = c.record("poll.h", "struct pollfd", { fd: i32, events: i16, revents: i16 })
+Polling = c.bind("poll.h", {
+    POLLIN: i16
+    poll = (fds: Ptr<PollFd>, count: u32, timeout_ms: i32) i32
+})
+
+IDLE_MS: i32 = 1000
+
+Watcher*<W: Watch, B: TransportBackend> = {
+    backend :: W,
+    // Newline-separated files and directories to watch recursively.
+    roots: str,
+    builder: Ref<Builder<B>>,
+    debounce :: Debounce,
+    poll :: Ptr<PollFd> = null_ptr<PollFd>(),
+    armed :: bool = false,
+
+    // Re-registers the whole tree so entries created since the last walk
+    // are covered. The walk's scratch arena lives for this call.
+    rearm = (self :: @Self, ctx: Context) Res<usize, AllocError> {
+        scratch = ctx.env.mem.alloc();
+        arm(self.backend, scratch, self.roots)
+    }
+}
+
+Watcher.impl(Actor, {
+    begin = (self :: @Self, ctx: Context, me: Ref<Watcher<W, B>>) {
+        self.poll = ctx.alloc.realloc<PollFd>(null_ptr<PollFd>(), 1).match({ Ok(p) => p, Err(_) => null_ptr<PollFd>() });
+        opened = self.backend.open(ctx.alloc);
+        self.armed = opened && !self.poll.is_null() && self.rearm(ctx).match({
+            Ok(count) => { ctx.env.out.println("zen-serve: watching {} files and directories", count).ignore(); ctx.env.out.flush().ignore(); true },
+            Err(_)    => false,
+        });
+        (!self.armed).then(() { ctx.env.out.println("zen-serve: file watching is unavailable").ignore(); ctx.env.out.flush().ignore(); });
+        self.armed.then(() { me.turn(me).ignore(); });
+    }
+
+    turn = (self :: @Self, ctx: Context, me: Ref<Watcher<W, B>>) {
+        now = ctx.env.clock.since_start().millis_of();
+        timeout = self.debounce.wait_ms(now, IDLE_MS);
+        self.poll.write(0, PollFd(fd: self.backend.fd(), events: Polling.POLLIN, revents: 0));
+        (Polling.poll(self.poll, 1, timeout) > 0 && self.backend.drain()).then(() {
+            self.debounce.touch(ctx.env.clock.since_start().millis_of());
+            // New files and directories need registrations of their own.
+            self.rearm(ctx).ignore();
+        });
+        self.debounce.due(ctx.env.clock.since_start().millis_of()).then(() {
+            changes = self.debounce.take();
+            self.builder.changed(self.builder, changes).ignore();
+        });
+        me.turn(me).ignore();
+    }
+
+    stopped = (self :: @Self, ctx: Context) { self.backend.close_all(); }
+})
