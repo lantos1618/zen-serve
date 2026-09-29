@@ -154,6 +154,9 @@ the client cannot yet be a Zen program built by the JavaScript backend.
 A design for swapping `app.js` without losing application state is in
 [docs/HOT_RELOAD.md](docs/HOT_RELOAD.md). It is not implemented.
 
+Compiler and library gaps met on the way, with minimal repros, are in
+[docs/COMPILER_GAPS.md](docs/COMPILER_GAPS.md).
+
 ## Limits
 
 IPv4 only; 64 simultaneous connections; request heads up to 16 KiB and no
