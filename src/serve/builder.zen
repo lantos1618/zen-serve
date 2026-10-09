@@ -7,12 +7,30 @@
 // one follow-up build.
 Alloc, AllocError, Ptr, null_ptr = std.mem
 str, String = std.text
+Sink, WriteError = std.core.io
 TransportBackend = http.server_core
 BuildQueue = serve.watch
 Server, Wake = serve.server
 
 // Diagnostics beyond this are cut; the overlay is for reading, not archiving.
 MAX_DIAGNOSTICS: usize = 65536
+
+// Keep draining both child pipes after the display budget is exhausted.
+BoundedDiagnostics = { data :: String }
+BoundedDiagnostics.impl(Sink, {
+    write = (self :: @Self, bytes: str) Res<(), WriteError> {
+        remaining = MAX_DIAGNOSTICS - self.data.len();
+        self.data.add(bytes.slice(0, bytes.len.min(remaining))).try();
+        Ok(())
+    }
+
+    write_byte = (self :: @Self, byte: u8) Res<(), WriteError> {
+        (self.data.len() < MAX_DIAGNOSTICS).then(
+            () { self.data.add(byte).try(); }
+        );
+        Ok(())
+    }
+})
 
 BuildOutcome* = { ok*: bool, diagnostics*: str, millis*: u64 }
 
@@ -26,10 +44,17 @@ run_build* = (
     command : str
 ) Res<BuildOutcome, AllocError> {
     started = env.clock.since_start().millis_of();
-    result  = env.proc.run(a, project, command);
-    millis  = env.clock.since_start().millis_of() - started;
+    argv ::= a.Vec<str>();
+    argv.add("/bin/sh").try();
+    argv.add("-c").try();
+    argv.add(command).try();
+    argv.add("sh").try();
+    out ::= BoundedDiagnostics(data: a.String().try());
+    err ::= BoundedDiagnostics(data: a.String().try());
+    result = env.proc.run_argv_into(a, project, argv, out, err);
+    millis = env.clock.since_start().millis_of() - started;
     result.match({
-        Err(_)     => {
+        Err(_)   => {
             text = a.String(
                 "$ {}\ncould not start /bin/sh for the build command\n",
                 command
@@ -40,7 +65,7 @@ run_build* = (
                 millis: millis
             ))
         },
-        Ok(output) => (output.code == 0).match({
+        Ok(code) => (code == 0).match({
             true  => Ok(BuildOutcome(
                 ok: true,
                 diagnostics: "",
@@ -50,12 +75,12 @@ run_build* = (
                 text ::= a.String(
                     "$ {}\nexit status {}\n\n",
                     command,
-                    output.code
+                    code
                 ).try();
-                text.add(output.err.view()).try();
-                (output.out.len() > 0).then(() {
+                text.add(err.data.view()).try();
+                (out.data.len() > 0).then(() {
                     (text.len() > 0 && !text.view().ends_with("\n")).then(() { text.add('\n').try(); });
-                    text.add(output.out.view()).try();
+                    text.add(out.data.view()).try();
                 });
                 view    = text.view();
                 clipped = (view.len > MAX_DIAGNOSTICS).match({
